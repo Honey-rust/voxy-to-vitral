@@ -96,15 +96,20 @@ public class VoxyRenderSystem {
         }
 
         //Fking HATE EVERYTHING AAAAAAAAAAAAAAAA
+        boolean isVitrail = net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail");
         int[] oldBufferBindings = new int[10];
-        for (int i = 0; i < oldBufferBindings.length; i++) {
-            oldBufferBindings[i] = glGetIntegeri(GL_SHADER_STORAGE_BUFFER_BINDING, i);
+        if (!isVitrail) {
+            for (int i = 0; i < oldBufferBindings.length; i++) {
+                oldBufferBindings[i] = glGetIntegeri(GL_SHADER_STORAGE_BUFFER_BINDING, i);
+            }
         }
 
         try {
-            //wait for opengl to be finished, this should hopefully ensure all memory allocations are free
-            glFinish();
-            glFinish();
+            if (!isVitrail) {
+                //wait for opengl to be finished, this should hopefully ensure all memory allocations are free
+                glFinish();
+                glFinish();
+            }
 
             this.worldIn = world;
 
@@ -175,14 +180,16 @@ public class VoxyRenderSystem {
             throw e;
         }
 
-        for (int i = 0; i < oldBufferBindings.length; i++) {
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, oldBufferBindings[i]);
-        }
+        if (!isVitrail) {
+            for (int i = 0; i < oldBufferBindings.length; i++) {
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, oldBufferBindings[i]);
+            }
 
-        for (int i = 0; i < 12; i++) {
-            GlStateManager._activeTexture(GlConst.GL_TEXTURE0+i);
-            GlStateManager._bindTexture(0);
-            glBindSampler(i, 0);
+            for (int i = 0; i < 12; i++) {
+                GlStateManager._activeTexture(GlConst.GL_TEXTURE0+i);
+                GlStateManager._bindTexture(0);
+                glBindSampler(i, 0);
+            }
         }
     }
 
@@ -249,6 +256,10 @@ public class VoxyRenderSystem {
 
 
     public void renderOpaque(Viewport<?> viewport, int sourceDepthTexture, int sourceColourTexture) {
+        // === Vitrail Vulkan 模式下跳过 OpenGL 绘制循环，防止帧循环硬闪退 ===
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            return;
+        }
         if (viewport == null) {
             return;
         }
