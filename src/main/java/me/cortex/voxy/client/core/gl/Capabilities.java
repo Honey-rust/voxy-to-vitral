@@ -55,8 +55,7 @@ public class Capabilities {
     public final boolean hasBrokenDepthSampler;
 
     public Capabilities() {
-        public Capabilities() {
-        // === 新增：检测 Vitrail (Vulkan) 或 null 保护，防止崩溃 ===
+        // === 1. Vitrail (Vulkan) 环境保护：安全赋默认值并退出，不执行任何 GL 调用 ===
         if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
             org.slf4j.LoggerFactory.getLogger("Voxy").info("[Voxy] Vitrail (Vulkan) detected! Setting fallback capabilities.");
             this.sparseBuffer = false;
@@ -67,10 +66,20 @@ public class Capabilities {
             this.canQueryGpuMemory = false;
             this.INT64_t = false;
             this.subgroup = false;
+            this.ssboMaxSize = -1;
+            this.ssboBindingAlignment = 0;
+            this.isMesa = false;
+            this.isIntel = false;
+            this.isNvidia = false;
+            this.isAmd = false;
+            this.totalDedicatedMemory = -1;
+            this.totalDynamicMemory = -1;
+            this.nvBarryCoords = false;
+            this.hasBrokenDepthSampler = false;
             return;
         }
-        // ========================================================
 
+        // === 2. 原生 OpenGL 环境逻辑 ===
         var cap = GL.getCapabilities();
         if (cap == null) {
             this.sparseBuffer = false;
@@ -81,6 +90,16 @@ public class Capabilities {
             this.canQueryGpuMemory = false;
             this.INT64_t = false;
             this.subgroup = false;
+            this.ssboMaxSize = -1;
+            this.ssboBindingAlignment = 0;
+            this.isMesa = false;
+            this.isIntel = false;
+            this.isNvidia = false;
+            this.isAmd = false;
+            this.totalDedicatedMemory = -1;
+            this.totalDynamicMemory = -1;
+            this.nvBarryCoords = false;
+            this.hasBrokenDepthSampler = false;
             return;
         }
 
@@ -90,15 +109,7 @@ public class Capabilities {
         this.repFragTest = cap.GL_NV_representative_fragment_test;
         this.meshShaders = cap.GL_NV_mesh_shader;
         this.canQueryGpuMemory = cap.GL_NVX_gpu_memory_info;
-        // ... 后续原生代码保持不变 ...
-        var cap = GL.getCapabilities();
-        this.sparseBuffer = cap.GL_ARB_sparse_buffer;
-        this.compute = cap.glDispatchComputeIndirect != 0;
-        this.indirectParameters = cap.glMultiDrawElementsIndirectCountARB != 0;
-        this.repFragTest = cap.GL_NV_representative_fragment_test;
-        this.meshShaders = cap.GL_NV_mesh_shader;
-        this.canQueryGpuMemory = cap.GL_NVX_gpu_memory_info;
-        //this.INT64_t = cap.GL_ARB_gpu_shader_int64 || cap.GL_AMD_gpu_shader_int64;
+        
         //The only reliable way to test for int64 support is to try compile a shader
         this.INT64_t = testShaderCompilesOk(ShaderType.COMPUTE, """
                 #version 430
@@ -150,7 +161,6 @@ public class Capabilities {
             this.hasBrokenDepthSampler = false;
         }
     }
-
     public static void init() {
     }
 
