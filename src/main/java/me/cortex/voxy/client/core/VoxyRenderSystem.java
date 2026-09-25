@@ -94,23 +94,59 @@ public class VoxyRenderSystem {
 
         boolean isVitrail = FabricLoader.getInstance().isModLoaded("vitrail");
 
-        // === Vitrail (Vulkan) 模式：彻底跳过所有 OpenGL 原生管线与着色器初始化 ===
+        // === Vitrail (Vulkan) 模式：启动纯 CPU 后台多线程数据生成引擎，跳过 OpenGL 着色器管线 ===
         if (isVitrail) {
             this.worldIn = world;
-            this.properties = null;
-            this.visbleSectionStream = null;
-            this.modelService = null;
-            this.renderGen = null;
-            this.geometryData = null;
-            this.geoRef = null;
-            this.nodeManager = null;
-            this.nodeCleaner = null;
+            this.properties = RenderProperties.getRenderProperties();
+            this.visbleSectionStream = new StreamedBoundStore();
+            var backendFactory = getRenderBackendFactory();
+            {
+                this.modelService = new ModelBakerySubsystem(world.getMapper());
+                this.renderGen = new RenderGenerationService(world, this.modelService, sm, IUsesMeshlets.class.isAssignableFrom(backendFactory.clz()));
+
+                this.geometryData = new BasicSectionGeometryData(1<<20, RenderResourceReuse.getOrCreateGeometryBuffer());
+
+                if (((BasicSectionGeometryData)this.geometryData).isExternalGeometryBuffer) {
+                    var buffer = ((BasicSectionGeometryData)this.geometryData).getGeometryBuffer();
+                    this.geoRef = GlobalCleaner.CLEANER.register(this.geometryData,() -> RenderResourceReuse.giveBackGeometryBuffer(buffer));
+                } else {
+                    this.geoRef = null;
+                }
+
+                this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData, this.renderGen);
+                this.nodeCleaner = new NodeCleaner(this.nodeManager);
+
+                world.setDirtyCallback(this.nodeManager::worldEvent);
+
+                Arrays.stream(world.getMapper().getBiomeEntries()).forEach(this.modelService::addBiome);
+                world.getMapper().setBiomeCallback(this.modelService::addBiome);
+
+                this.nodeManager.start();
+            }
+
+            {
+                int minSec = Minecraft.getInstance().level.getMinSectionY() >> 5;
+                int maxSec = (Minecraft.getInstance().level.getMaxSectionY() - 1) >> 5;
+
+                if (VoxyCommon.IS_MINE_IN_ABYSS) {
+                    minSec = -8;
+                    maxSec = 7;
+                }
+
+                this.renderDistanceTracker = new RenderDistanceTracker(40,
+                        minSec,
+                        maxSec,
+                        this.nodeManager::addTopLevel,
+                        this.nodeManager::removeTopLevel);
+
+                this.setRenderDistance(VoxyConfig.CONFIG.sectionRenderDistance);
+            }
+
             this.traversal = null;
             this.pipeline = null;
             this.viewportSelector = null;
-            this.renderDistanceTracker = null;
             this.boundOutlineRenderer = null;
-            Logger.info("Voxy render system: Vitrail (Vulkan) detected. OpenGL render pipelines completely bypassed.");
+            Logger.info("Voxy render system: Vitrail (Vulkan) LOD background engine successfully started!");
             return;
         }
 
@@ -201,6 +237,12 @@ public class VoxyRenderSystem {
 
     public Viewport<?> setupViewport(Matrix4fc vanillaProjection, Matrix4fc modelView, FogParameters fogParameters, int width, int height, double cameraX, double cameraY, double cameraZ) {
         if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+            if (this.renderDistanceTracker != null) {
+                this.renderDistanceTracker.setCenterAndProcess(cameraX, cameraZ);
+            }
+            if (this.modelService != null) {
+                this.modelService.tick(900_000);
+            }
             return null;
         }
 
@@ -224,7 +266,6 @@ public class VoxyRenderSystem {
         var voxyProjection = computeProjectionMat(this.properties, vanillaProjection, farPlaneChunks*16);
 
         {
-            //Apply render scaling factor
             var factor = this.pipeline.getRenderScalingFactor();
             if (factor != null) {
                 int yIndex = 1;
@@ -428,10 +469,9 @@ public class VoxyRenderSystem {
     }
 
     public void setRenderDistance(float renderDistance) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
-            return;
+        if (this.renderDistanceTracker != null) {
+            this.renderDistanceTracker.setRenderDistance((int) Math.ceil(renderDistance + 1));
         }
-        this.renderDistanceTracker.setRenderDistance((int) Math.ceil(renderDistance+1));
     }
 
     public Viewport<?> getViewport() {
@@ -446,7 +486,10 @@ public class VoxyRenderSystem {
 
     public void addDebugInfo(List<String> debug) {
         if (FabricLoader.getInstance().isModLoaded("vitrail")) {
-            debug.add("Voxy: Running in Vitrail (Vulkan) mode");
+            debug.add("Voxy [Vitrail/Vulkan]: LOD Engine Active");
+            if (this.modelService != null) this.modelService.addDebugData(debug);
+            if (this.renderGen != null) this.renderGen.addDebugData(debug);
+            if (this.nodeManager != null) this.nodeManager.addDebug(debug);
             return;
         }
         debug.add("Buf/Tex [#/Mb]: [" + GlBuffer.getCount() + "/" + (GlBuffer.getTotalSize()/1_000_000) + "],[" + GlTexture.getCount() + "/" + (GlTexture.getEstimatedTotalSize()/1_000_000)+"]");
@@ -468,6 +511,35 @@ public class VoxyRenderSystem {
 
     public void shutdown() {
         if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+            try {
+                this.worldIn.setDirtyCallback(null);
+                this.worldIn.getMapper().setBiomeCallback(null);
+                this.worldIn.getMapper().setStateCallback(null);
+
+                if (this.nodeManager != null) {
+                    this.nodeManager.stop();
+                }
+                if (this.modelService != null) {
+                    this.modelService.shutdown();
+                }
+                if (this.renderGen != null) {
+                    this.renderGen.shutdown();
+                }
+                if (this.nodeCleaner != null) {
+                    this.nodeCleaner.free();
+                }
+                if (this.geometryData != null) {
+                    this.geometryData.free();
+                }
+                if (this.geoRef != null) {
+                    this.geoRef.clean();
+                }
+                if (this.visbleSectionStream != null) {
+                    this.visbleSectionStream.free();
+                }
+            } catch (Exception e) {
+                Logger.error("Error shutting down renderer components in Vitrail mode", e);
+            }
             if (this.worldIn != null) {
                 this.worldIn.releaseRef();
             }
