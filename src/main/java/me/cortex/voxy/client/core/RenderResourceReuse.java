@@ -46,7 +46,7 @@ public class RenderResourceReuse {
         MODEL_TEXTURE_CACHE.add(texture);
     }
 
-    static GlBuffer getOrCreateGeometryBuffer() {
+   static GlBuffer getOrCreateGeometryBuffer() {
         if (!GEOMETRY_BUFFER_CACHE.isEmpty()) {
             return GEOMETRY_BUFFER_CACHE.removeFirst();
         }
@@ -93,6 +93,10 @@ public class RenderResourceReuse {
         }
         Logger.info("Allocated new geometry buffer: " + buffer.size() + ", isSparse: " + buffer.isSparse() + extra);
         return buffer;
+    }
+
+    public static void giveBackGeometryBuffer(GlBuffer geometryBuffer) {
+        GEOMETRY_BUFFER_CACHE.add(geometryBuffer);
     }
 
     private static long getGeometryBufferSize() {
