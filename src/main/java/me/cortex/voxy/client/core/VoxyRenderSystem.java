@@ -224,10 +224,12 @@ public class VoxyRenderSystem {
         var voxyProjection = computeProjectionMat(this.properties, vanillaProjection, farPlaneChunks*16);
 
         {
+            //Apply render scaling factor
             var factor = this.pipeline.getRenderScalingFactor();
             if (factor != null) {
+                int yIndex = 1;
                 width = (int) (width * factor[0]);
-                height = (int) (height * factor);
+                height = (int) (height * factor[yIndex]);
             }
         }
         if (width == 0 || height == 0) {
@@ -335,8 +337,9 @@ public class VoxyRenderSystem {
 
         GPUTiming.INSTANCE.tick();
 
+        int yIndex = 1;
         glBindFramebuffer(GlConst.GL_FRAMEBUFFER, oldFB);
-        glViewport(dims[0], dims, dims[2], dims[3]);
+        glViewport(dims[0], dims[yIndex], dims[2], dims[3]);
 
         {
             GlStateManager._glUseProgram(0);
