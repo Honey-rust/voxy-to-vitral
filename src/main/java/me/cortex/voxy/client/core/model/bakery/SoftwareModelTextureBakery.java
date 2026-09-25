@@ -1,7 +1,7 @@
-import net.fabricmc.loader.api.FabricLoader;
-import java.util.Arrays;
 package me.cortex.voxy.client.core.model.bakery;
 
+import net.fabricmc.loader.api.FabricLoader;
+import java.util.Arrays;
 import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.opengl.GlTexture;
 import com.mojang.blaze3d.vertex.PoseStack;
