@@ -40,8 +40,17 @@ public class GlBuffer extends TrackedObject {
 
     private GlBuffer(long size, int flags, boolean zero, long data) {
         this.flags = flags;
-        this.id = glCreateBuffers();
         this.size = size;
+
+        // === Vitrail (Vulkan) 模式：赋予虚拟缓冲句柄，不执行原生 GL 指令 ===
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            this.id = 0;
+            COUNT++;
+            TOTAL_SIZE += size;
+            return;
+        }
+
+        this.id = glCreateBuffers();
         nglNamedBufferStorage(this.id, size, data, flags);
         if ((flags&GL_SPARSE_STORAGE_BIT_ARB)==0 && zero) {
             this.zero();
@@ -54,7 +63,9 @@ public class GlBuffer extends TrackedObject {
     @Override
     public void free() {
         this.free0();
-        glDeleteBuffers(this.id);
+        if (!net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            glDeleteBuffers(this.id);
+        }
 
         COUNT--;
         TOTAL_SIZE -= this.size;
@@ -69,16 +80,23 @@ public class GlBuffer extends TrackedObject {
     }
 
     public GlBuffer zero() {
-        nglClearNamedBufferData(this.id, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 0);
+        if (!net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            nglClearNamedBufferData(this.id, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 0);
+        }
         return this;
     }
 
     public GlBuffer zeroRange(long offset, long size) {
-        nglClearNamedBufferSubData(this.id, GL_R8UI, offset, size, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 0);
+        if (!net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            nglClearNamedBufferSubData(this.id, GL_R8UI, offset, size, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 0);
+        }
         return this;
     }
 
     public GlBuffer fill(int data) {
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            return this;
+        }
         //Clear unpack values
         //Fixed in mesa commit a5c3c452
         glPixelStorei(GL11.GL_UNPACK_SKIP_ROWS, 0);
@@ -98,6 +116,9 @@ public class GlBuffer extends TrackedObject {
     }
 
     public GlBuffer name(String name) {
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            return this;
+        }
         return GlDebug.name(name, this);
     }
 
