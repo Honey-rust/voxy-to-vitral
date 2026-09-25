@@ -226,8 +226,8 @@ public class VoxyRenderSystem {
         {
             var factor = this.pipeline.getRenderScalingFactor();
             if (factor != null) {
-                width = (int) (width*factor[0]);
-                height = (int) (height*factor);
+                width = (int) (width * factor[0]);
+                height = (int) (height * factor);
             }
         }
         if (width == 0 || height == 0) {
