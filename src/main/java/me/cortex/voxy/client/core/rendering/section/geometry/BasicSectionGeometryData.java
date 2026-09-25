@@ -79,16 +79,19 @@ public class BasicSectionGeometryData implements IGeometryData {
     }
 
     private long sparseCommitment = 0;//Tracks the current range of the allocated sparse buffer
-    public void ensureAccessable(int maxElementAccess) {
+    ppublic void ensureAccessable(int maxElementAccess) {
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            return;
+        }
+
         long size = (Integer.toUnsignedLong(maxElementAccess)*8L+65535L)&~65535L;
         //If we are a sparse buffer, ensure the memory upto the requested size is allocated
         if (this.geometryBuffer.isSparse()) {
-            if (this.sparseCommitment < size) {//if we try to access memory outside the allocation range, allocate it
+            if (this.sparseCommitment < size) {
                 glBindBuffer(GL_ARRAY_BUFFER, this.geometryBuffer.id);
-                size += 65536L*1024;//increase size by 64mb to prevent driver allocation thrashing
+                size += 65536L*1024;
                 glBufferPageCommitmentARB(GL_ARRAY_BUFFER, this.sparseCommitment, size-this.sparseCommitment, true);
                 glBindBuffer(GL_ARRAY_BUFFER, 0);
-                //Logger.info("Resizing sparse: " + this.sparseCommitment + ", " + (size-this.sparseCommitment));
                 this.sparseCommitment = size;
             }
         }
@@ -123,6 +126,13 @@ public class BasicSectionGeometryData implements IGeometryData {
     public void free() {
         this.sectionMetadataBuffer.free();
 
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            if (!this.isExternalGeometryBuffer) {
+                this.geometryBuffer.free();
+            }
+            return;
+        }
+
         long gpuMemory = 0;
         if (Capabilities.INSTANCE.canQueryGpuMemory) {
             glFinish();
@@ -140,8 +150,8 @@ public class BasicSectionGeometryData implements IGeometryData {
             this.geometryBuffer.free();
             glFinish();
             if (Capabilities.INSTANCE.canQueryGpuMemory) {
-                long releaseSize = (long) (this.geometryBuffer.size() * 0.75);//if gpu memory usage drops by 75% of the expected value assume we freed it
-                if (this.geometryBuffer.isSparse()) {//If we are using sparse buffers, use the commited size instead
+                long releaseSize = (long) (this.geometryBuffer.size() * 0.75);
+                if (this.geometryBuffer.isSparse()) {
                     releaseSize = (long) (this.sparseCommitment * 0.75);
                 }
                 if (Capabilities.INSTANCE.getFreeDedicatedGpuMemory() - gpuMemory <= releaseSize) {
@@ -150,7 +160,7 @@ public class BasicSectionGeometryData implements IGeometryData {
 
                     long TIMEOUT = 400;
 
-                    while (System.currentTimeMillis() - start < TIMEOUT) {//Wait up to 2.5 seconds for memory to release
+                    while (System.currentTimeMillis() - start < TIMEOUT) {
                         glFinish();
                         if (Capabilities.INSTANCE.getFreeDedicatedGpuMemory() - gpuMemory > releaseSize) break;
                     }

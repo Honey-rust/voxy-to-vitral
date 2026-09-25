@@ -47,54 +47,52 @@ public class RenderResourceReuse {
     }
 
     static GlBuffer getOrCreateGeometryBuffer() {
-        GlBuffer buffer = null;
         if (!GEOMETRY_BUFFER_CACHE.isEmpty()) {
-            buffer = GEOMETRY_BUFFER_CACHE.removeFirst();
-            //Reuse buffer, todo: probably check the geometry size and try upsize if possible
-        } else {
-            long capacity = getGeometryBufferSize();
-            long driverMemory = -1;
-            if (Capabilities.INSTANCE.canQueryGpuMemory) {
-                driverMemory = Capabilities.INSTANCE.getFreeDedicatedGpuMemory();
-            }
-
-            glGetError();//Clear any errors
-            if (!(Capabilities.INSTANCE.isNvidia&& ThreadUtils.isWindows&&Capabilities.INSTANCE.sparseBuffer)) {//This hack makes it so it doesnt crash on renderdoc
-                buffer = new GlBuffer(capacity, false);//Only do this if we are not on nvidia
-                //TODO: FIXME: TEST, see if the issue is that we are trying to zero the entire buffer, try only zeroing increments
-                // or dont zero it at all
-            } else {
-                Logger.info("Running on nvidia, using workaround sparse buffer allocation");
-            }
-            int error = glGetError();
-            if (error != GL_NO_ERROR || buffer == null) {
-                if ((buffer == null || error == GL_OUT_OF_MEMORY) && Capabilities.INSTANCE.sparseBuffer) {
-                    if (buffer != null) {
-                        Logger.error("Failed to allocate geometry buffer, attempting workaround with sparse buffers");
-                        buffer.free();
-                    }
-                    buffer = new GlBuffer(capacity, GL_SPARSE_STORAGE_BIT_ARB);
-                    //buffer.zero();
-                    error = glGetError();
-                    if (error != GL_NO_ERROR) {
-                        buffer.free();
-                        throw new IllegalStateException("Unable to allocate geometry buffer using workaround, got gl error " + error + ". Failed to allocate buffer of size "+capacity);
-                    }
-                } else {
-                    throw new IllegalStateException("Unable to allocate geometry buffer, got gl error " + error + ". Failed to allocate buffer of size "+capacity);
-                }
-            }
-            String extra = "";
-            if (driverMemory != -1) {
-                extra = ", driver stated " + (driverMemory/(1024*1024)) + "Mb of free memory";
-            }
-            Logger.info("Allocated new geometry buffer: " + buffer.size() + ", isSparse: " + buffer.isSparse() + extra);
+            return GEOMETRY_BUFFER_CACHE.removeFirst();
         }
-        return buffer;
-    }
+        long capacity = getGeometryBufferSize();
 
-    public static void giveBackGeometryBuffer(GlBuffer geometryBuffer) {
-        GEOMETRY_BUFFER_CACHE.add(geometryBuffer);
+        // === Vitrail (Vulkan) 模式：直接返回虚拟 GlBuffer，不走 OpenGL glGetError 与稀疏缓冲 ===
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            Logger.info("Allocating Vitrail (Vulkan) geometry buffer: " + capacity);
+            return new GlBuffer(capacity, 0, false);
+        }
+
+        GlBuffer buffer = null;
+        long driverMemory = -1;
+        if (Capabilities.INSTANCE.canQueryGpuMemory) {
+            driverMemory = Capabilities.INSTANCE.getFreeDedicatedGpuMemory();
+        }
+
+        glGetError();//Clear any errors
+        if (!(Capabilities.INSTANCE.isNvidia&& ThreadUtils.isWindows&&Capabilities.INSTANCE.sparseBuffer)) {
+            buffer = new GlBuffer(capacity, false);
+        } else {
+            Logger.info("Running on nvidia, using workaround sparse buffer allocation");
+        }
+        int error = glGetError();
+        if (error != GL_NO_ERROR || buffer == null) {
+            if ((buffer == null || error == GL_OUT_OF_MEMORY) && Capabilities.INSTANCE.sparseBuffer) {
+                if (buffer != null) {
+                    Logger.error("Failed to allocate geometry buffer, attempting workaround with sparse buffers");
+                    buffer.free();
+                }
+                buffer = new GlBuffer(capacity, GL_SPARSE_STORAGE_BIT_ARB);
+                error = glGetError();
+                if (error != GL_NO_ERROR) {
+                    buffer.free();
+                    throw new IllegalStateException("Unable to allocate geometry buffer using workaround, got gl error " + error + ". Failed to allocate buffer of size "+capacity);
+                }
+            } else {
+                throw new IllegalStateException("Unable to allocate geometry buffer, got gl error " + error + ". Failed to allocate buffer of size "+capacity);
+            }
+        }
+        String extra = "";
+        if (driverMemory != -1) {
+            extra = ", driver stated " + (driverMemory/(1024*1024)) + "Mb of free memory";
+        }
+        Logger.info("Allocated new geometry buffer: " + buffer.size() + ", isSparse: " + buffer.isSparse() + extra);
+        return buffer;
     }
 
     private static long getGeometryBufferSize() {
