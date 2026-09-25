@@ -4,6 +4,7 @@ import me.cortex.voxy.client.core.RenderResourceReuse;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
 import me.cortex.voxy.common.util.GlobalCleaner;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.resources.Identifier;
@@ -28,35 +29,43 @@ public class ModelStore {
     final GlBuffer modelBuffer;
     final GlBuffer modelColourBuffer;
     final GlTexture textures;
-    public final int blockSampler = glGenSamplers();
+    public final int blockSampler;
 
     public ModelStore() {
+        boolean isVitrail = FabricLoader.getInstance().isModLoaded("vitrail");
+        this.blockSampler = isVitrail ? 0 : glGenSamplers();
+
         this.modelBuffer = new GlBuffer(MODEL_SIZE * (1<<16)).name("ModelData");
         this.modelColourBuffer = new GlBuffer(4 * (1<<16)).name("ModelColour");
         var tex = this.textures = RenderResourceReuse.getOrCreateModelStoreTextureAtlas();
         this.ref = GlobalCleaner.CLEANER.register(this, ()->RenderResourceReuse.giveBackModelStoreTextureAtlas(tex));
 
-        //Limit the mips of the texture to match that of the terrain atlas
-        int mipLvl = ((TextureAtlas) Minecraft.getInstance().getTextureManager()
-                .getTexture(Identifier.fromNamespaceAndPath("minecraft", "textures/atlas/blocks.png")))
-                .maxMipLevel;
+        if (!isVitrail) {
+            //Limit the mips of the texture to match that of the terrain atlas
+            int mipLvl = ((TextureAtlas) Minecraft.getInstance().getTextureManager()
+                    .getTexture(Identifier.fromNamespaceAndPath("minecraft", "textures/atlas/blocks.png")))
+                    .maxMipLevel;
 
-        glSamplerParameteri(this.blockSampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_LINEAR);
-        glSamplerParameteri(this.blockSampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glSamplerParameteri(this.blockSampler, GL_TEXTURE_MIN_LOD, 0);
-        glSamplerParameteri(this.blockSampler, GL_TEXTURE_MAX_LOD, mipLvl);//Integer.numberOfTrailingZeros(ModelFactory.MODEL_TEXTURE_SIZE)
+            glSamplerParameteri(this.blockSampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_LINEAR);
+            glSamplerParameteri(this.blockSampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glSamplerParameteri(this.blockSampler, GL_TEXTURE_MIN_LOD, 0);
+            glSamplerParameteri(this.blockSampler, GL_TEXTURE_MAX_LOD, mipLvl);
+        }
     }
-
 
     public void free() {
         this.modelBuffer.free();
         this.modelColourBuffer.free();
         this.ref.clean();
-        glDeleteSamplers(this.blockSampler);
+        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+            glDeleteSamplers(this.blockSampler);
+        }
     }
 
-
     public void bind(int modelBindingIndex, int colourBindingIndex, int textureBindingIndex) {
+        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+            return;
+        }
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, modelBindingIndex, this.modelBuffer.id);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, colourBindingIndex, this.modelColourBuffer.id);
         glBindTextureUnit(textureBindingIndex, this.textures.id);

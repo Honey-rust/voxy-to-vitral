@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.gl;
 
 import me.cortex.voxy.common.util.TrackedObject;
+import net.fabricmc.loader.api.FabricLoader;
 
 import static org.lwjgl.opengl.GL11.GL_RGBA8;
 import static org.lwjgl.opengl.GL11C.*;
@@ -24,13 +25,19 @@ public class GlTexture extends TrackedObject {
     }
 
     public GlTexture(int type) {
-        this.id = glCreateTextures(type);
+        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+            this.id = 0;
+        } else {
+            this.id = glCreateTextures(type);
+        }
         this.type = type;
         COUNT++;
     }
 
     private GlTexture(int type, boolean useGenTypes) {
-        if (useGenTypes) {
+        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+            this.id = 0;
+        } else if (useGenTypes) {
             this.id = glGenTextures();
         } else {
             this.id = glCreateTextures(type);
@@ -47,7 +54,9 @@ public class GlTexture extends TrackedObject {
 
         this.format = format;
         if (this.type == GL_TEXTURE_2D) {
-            glTextureStorage2D(this.id, levels, format, width, height);
+            if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+                glTextureStorage2D(this.id, levels, format, width, height);
+            }
             this.width = width;
             this.height = height;
             this.levels = levels;
@@ -61,7 +70,9 @@ public class GlTexture extends TrackedObject {
     public GlTexture createView() {
         this.assertAllocated();
         var view = new GlTexture(this.type, true);
-        glTextureView(view.id, this.type, this.id, this.format, 0, 1, 0, 1);
+        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+            glTextureView(view.id, this.type, this.id, this.format, 0, 1, 0, 1);
+        }
         return view;
     }
 
@@ -73,11 +84,16 @@ public class GlTexture extends TrackedObject {
         COUNT--;
         this.hasAllocated = false;
         super.free0();
-        glDeleteTextures(this.id);
+        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+            glDeleteTextures(this.id);
+        }
     }
 
     public GlTexture name(String name) {
         this.assertAllocated();
+        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+            return this;
+        }
         return GlDebug.name(name, this);
     }
 
@@ -140,6 +156,9 @@ public class GlTexture extends TrackedObject {
 
     public GlTexture zero() {
         this.assertAllocated();
+        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+            return this;
+        }
         int type = switch (this.format) {
             case GL_R32UI -> GL_UNSIGNED_INT;
             case GL_RGBA8 -> GL_INT;
