@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.core.gl.shader;
 
+import net.fabricmc.loader.api.FabricLoader;
 import me.cortex.voxy.client.core.gl.Capabilities;
 import me.cortex.voxy.client.core.gl.GlDebug;
 import me.cortex.voxy.common.Logger;
@@ -30,16 +31,22 @@ public class Shader extends TrackedObject {
     }
 
     public void bind() {
-        glUseProgram(this.id);
+        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+            glUseProgram(this.id);
+        }
     }
 
     public void free() {
         super.free0();
-        glDeleteProgram(this.id);
+        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+            glDeleteProgram(this.id);
+        }
     }
 
-
     public Shader name(String name) {
+        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+            return this;
+        }
         return GlDebug.name(name, this);
     }
 
@@ -144,6 +151,9 @@ public class Shader extends TrackedObject {
 
 
         private int compileToProgram() {
+            if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+                return 0;
+            }
             int program = GL20C.glCreateProgram();
             int[] shaders = new int[this.sources.size()];
             {
