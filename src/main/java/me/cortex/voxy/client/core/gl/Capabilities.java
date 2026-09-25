@@ -55,19 +55,19 @@ public class Capabilities {
     public final boolean hasBrokenDepthSampler;
 
     public Capabilities() {
-        // === 1. Vitrail (Vulkan) 环境保护：安全赋默认值并退出，不执行任何 GL 调用 ===
+        // === 1. Vitrail (Vulkan) 环境：赋予支持参数，唤醒 Voxy 设置与逻辑 ===
         if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
-            org.slf4j.LoggerFactory.getLogger("Voxy").info("[Voxy] Vitrail (Vulkan) detected! Setting fallback capabilities.");
-            this.sparseBuffer = false;
-            this.compute = false;
-            this.indirectParameters = false;
+            org.slf4j.LoggerFactory.getLogger("Voxy").info("[Voxy] Vitrail (Vulkan) detected! Enabling Voxy interface and pipeline.");
+            this.sparseBuffer = true;
+            this.compute = true;
+            this.indirectParameters = true;
             this.repFragTest = false;
             this.meshShaders = false;
             this.canQueryGpuMemory = false;
             this.INT64_t = false;
             this.subgroup = false;
-            this.ssboMaxSize = -1;
-            this.ssboBindingAlignment = 0;
+            this.ssboMaxSize = 134217728; // 模拟 128MB SSBO
+            this.ssboBindingAlignment = 256;
             this.isMesa = false;
             this.isIntel = false;
             this.isNvidia = false;
