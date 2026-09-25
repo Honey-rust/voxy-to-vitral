@@ -79,7 +79,7 @@ public class BasicSectionGeometryData implements IGeometryData {
     }
 
     private long sparseCommitment = 0;//Tracks the current range of the allocated sparse buffer
-    ppublic void ensureAccessable(int maxElementAccess) {
+    public void ensureAccessable(int maxElementAccess) {
         if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
             return;
         }
