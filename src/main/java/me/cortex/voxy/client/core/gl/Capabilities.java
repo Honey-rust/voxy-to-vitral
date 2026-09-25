@@ -55,6 +55,42 @@ public class Capabilities {
     public final boolean hasBrokenDepthSampler;
 
     public Capabilities() {
+        public Capabilities() {
+        // === 新增：检测 Vitrail (Vulkan) 或 null 保护，防止崩溃 ===
+        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+            org.slf4j.LoggerFactory.getLogger("Voxy").info("[Voxy] Vitrail (Vulkan) detected! Setting fallback capabilities.");
+            this.sparseBuffer = false;
+            this.compute = false;
+            this.indirectParameters = false;
+            this.repFragTest = false;
+            this.meshShaders = false;
+            this.canQueryGpuMemory = false;
+            this.INT64_t = false;
+            this.subgroup = false;
+            return;
+        }
+        // ========================================================
+
+        var cap = GL.getCapabilities();
+        if (cap == null) {
+            this.sparseBuffer = false;
+            this.compute = false;
+            this.indirectParameters = false;
+            this.repFragTest = false;
+            this.meshShaders = false;
+            this.canQueryGpuMemory = false;
+            this.INT64_t = false;
+            this.subgroup = false;
+            return;
+        }
+
+        this.sparseBuffer = cap.GL_ARB_sparse_buffer;
+        this.compute = cap.glDispatchComputeIndirect != 0;
+        this.indirectParameters = cap.glMultiDrawElementsIndirectCountARB != 0;
+        this.repFragTest = cap.GL_NV_representative_fragment_test;
+        this.meshShaders = cap.GL_NV_mesh_shader;
+        this.canQueryGpuMemory = cap.GL_NVX_gpu_memory_info;
+        // ... 后续原生代码保持不变 ...
         var cap = GL.getCapabilities();
         this.sparseBuffer = cap.GL_ARB_sparse_buffer;
         this.compute = cap.glDispatchComputeIndirect != 0;
