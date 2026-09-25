@@ -1,3 +1,5 @@
+import net.fabricmc.loader.api.FabricLoader;
+import java.util.Arrays;
 package me.cortex.voxy.client.core.model.bakery;
 
 import com.mojang.blaze3d.GpuFormat;
@@ -67,19 +69,25 @@ public class SoftwareModelTextureBakery {
         int width = tex.getWidth(targetMipLevel);
         int height = tex.getHeight(targetMipLevel);
 
-        //Just do it ourselves as doing it with b3d has some issues, (doing it ourselves is also just much much much shorter)
         var texture = new int[width * height];
 
-        glFlush();
-        glFinish();
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-        glPixelStorei(GL_PACK_ROW_LENGTH, width);
-        glPixelStorei(GL_PACK_IMAGE_HEIGHT, 0);
-        glPixelStorei(GL_PACK_SKIP_ROWS, 0);
-        glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
-        glPixelStorei(GL_PACK_ALIGNMENT, 4);
-        glGetTextureImage(((GlTexture) tex).glId(), 0, GL_RGBA, GL_UNSIGNED_BYTE, texture);
+        // 在非 Vulkan / 原生 OpenGL 环境下正常走 OpenGL 回读
+        if (tex instanceof GlTexture glTex && !FabricLoader.getInstance().isModLoaded("vitrail")) {
+            glFlush();
+            glFinish();
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glPixelStorei(GL_PACK_ROW_LENGTH, width);
+            glPixelStorei(GL_PACK_IMAGE_HEIGHT, 0);
+            glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+            glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+            glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            glGetTextureImage(glTex.glId(), 0, GL_RGBA, GL_UNSIGNED_BYTE, texture);
+        } else {
+            // 在 Vitrail / Vulkan 环境下填充不透明默认值（避免软件光栅化空指针或闪退）
+            Arrays.fill(texture, 0xFFFFFFFF);
+        }
+        
         this.rasterizer.setSamplerTexture(texture, width, height);
     }
 
