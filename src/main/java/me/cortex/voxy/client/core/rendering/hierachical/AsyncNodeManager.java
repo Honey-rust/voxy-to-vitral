@@ -28,6 +28,8 @@ import org.lwjgl.system.MemoryUtil;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
@@ -676,6 +678,7 @@ public class AsyncNodeManager {
 
     //TODO: add atomic counters for each event type probably
     private final ConcurrentLinkedDeque<MemoryBuffer> requestBatchQueue = new ConcurrentLinkedDeque<>();
+    private final Set<Long> cpuRefinementPending = ConcurrentHashMap.newKeySet();
     private final ConcurrentLinkedDeque<WorldSection> childUpdateQueue = new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<BuiltSection> geometryUpdateQueue = new ConcurrentLinkedDeque<>();
 
@@ -700,6 +703,49 @@ public class AsyncNodeManager {
     public void submitRequestBatch(MemoryBuffer batch) {//Only called from render thread
         this.requestBatchQueue.add(batch);
         this.addWork();
+    }
+
+    /** Queues a small, deduplicated CPU traversal batch when the OpenGL request shader is absent. */
+    public void submitCpuRefinementRequests(List<Long> positions) {
+        if (positions.isEmpty()) return;
+        long[] accepted = new long[Math.min(64, positions.size())];
+        int count = 0;
+        for (long position : positions) {
+            if (count == accepted.length) break;
+            if (this.cpuRefinementPending.add(position)) accepted[count++] = position;
+        }
+        if (count == 0) return;
+
+        MemoryBuffer batch = null;
+        boolean submitted = false;
+        try {
+            batch = new MemoryBuffer(8L + count * 8L);
+            MemoryUtil.memPutInt(batch.address, count);
+            MemoryUtil.memPutInt(batch.address + 4, 0);
+            long ptr = batch.address + 8;
+            for (int i = 0; i < count; i++) {
+                MemoryUtil.memPutInt(ptr, (int) (accepted[i] >>> 32));
+                MemoryUtil.memPutInt(ptr + 4, (int) accepted[i]);
+                ptr += 8;
+            }
+            this.submitRequestBatch(batch);
+            submitted = true;
+        } finally {
+            if (!submitted) {
+                if (batch != null) batch.free();
+                for (int i = 0; i < count; i++) this.cpuRefinementPending.remove(accepted[i]);
+            }
+        }
+    }
+
+    /** Drops CPU deduplication entries after their leaf has expanded or left the active graph. */
+    public void synchronizeCpuRefinementRequests(List<NodeManager.GeometryNode> nodes) {
+        if (this.cpuRefinementPending.isEmpty()) return;
+        Set<Long> activeLeaves = ConcurrentHashMap.newKeySet(nodes.size());
+        for (NodeManager.GeometryNode node : nodes) {
+            if (!node.inner()) activeLeaves.add(node.position());
+        }
+        this.cpuRefinementPending.removeIf(position -> !activeLeaves.contains(position));
     }
 
     private void submitChildChange(WorldSection section) {

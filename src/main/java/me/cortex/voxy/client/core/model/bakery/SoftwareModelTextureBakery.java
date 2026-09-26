@@ -1,7 +1,9 @@
 package me.cortex.voxy.client.core.model.bakery;
 
 import net.fabricmc.loader.api.FabricLoader;
-import java.util.Arrays;
+import java.nio.ByteOrder;
+import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.opengl.GlTexture;
 import com.mojang.blaze3d.vertex.PoseStack;
@@ -84,8 +86,28 @@ public class SoftwareModelTextureBakery {
             glPixelStorei(GL_PACK_ALIGNMENT, 4);
             glGetTextureImage(glTex.glId(), 0, GL_RGBA, GL_UNSIGNED_BYTE, texture);
         } else {
-            // 在 Vitrail / Vulkan 环境下填充不透明默认值（避免软件光栅化空指针或闪退）
-            Arrays.fill(texture, 0xFFFFFFFF);
+
+            // Read the same RGBA atlas used by the renderer, without OpenGL calls.
+            // setupTexture runs during model-service initialization, before baking starts.
+            var device = RenderSystem.getDevice();
+            try (var readback = device.createBuffer(() -> "Voxy block atlas readback",
+                    GpuBuffer.USAGE_COPY_DST | GpuBuffer.USAGE_MAP_READ,
+                    Math.multiplyExact((long) texture.length, Integer.BYTES))) {
+                var encoder = device.createCommandEncoder();
+                encoder.copyTextureToBuffer(tex, readback, 0L, () -> {}, targetMipLevel);
+                try (var fence = encoder.createFence()) {
+                    encoder.submit();
+                    if (!fence.awaitCompletion(10_000_000_000L)) {
+                        throw new IllegalStateException("Timed out reading Voxy's block atlas from the GPU");
+                    }
+                    try (var mapped = readback.map(true, false)) {
+                        // Rasterizer consumes ABGR ints: RGBA bytes on little-endian storage.
+                        mapped.data().order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(texture);
+                    }
+                }
+            }
+            org.slf4j.LoggerFactory.getLogger(SoftwareModelTextureBakery.class)
+                    .info("Voxy Vulkan block atlas readback complete: {}x{}", width, height);
         }
         
         this.rasterizer.setSamplerTexture(texture, width, height);

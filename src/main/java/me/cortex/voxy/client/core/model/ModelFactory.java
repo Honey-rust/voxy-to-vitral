@@ -111,6 +111,7 @@ public class ModelFactory {
     private final MemoryBuffer cpuModelData = new MemoryBuffer((long) MODEL_SIZE * (1 << 16)).zero();
     private int[] cpuBiomeColours = new int[0];
     private final int[] cpuFaceColours = new int[(1 << 16) * 6];
+    private final int[][] cpuFacePixels = new int[(1 << 16) * 6][];
     private final int[] cpuDistantMaterials = new int[1 << 16];
     private final int[] fluidStateLUT;
 
@@ -488,6 +489,8 @@ public class ModelFactory {
         int checkMode = layer==ChunkSectionLayer.SOLID?TextureUtils.WRITE_CHECK_STENCIL:TextureUtils.WRITE_CHECK_ALPHA;
         for (int face = 0; face < 6; face++) {
             this.cpuFaceColours[modelId * 6 + face] = averageFaceColour(textureData[face], checkMode);
+            if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive())
+                this.cpuFacePixels[modelId * 6 + face] = textureData[face].colour().clone();
         }
 
         ModelBakeResultUpload uploadResult = new ModelBakeResultUpload(!this.rasterUV);
@@ -1070,6 +1073,15 @@ public class ModelFactory {
         return (red << 24) | (green << 16) | (blue << 8) | alpha;
     }
 
+    /** Immutable baked ABGR pixels, for the optional Vulkan detail atlas. */
+    public int[] getVitrailFacePixels(int modelId, int face) {
+        return this.cpuFacePixels[modelId * 6 + face];
+    }
+
+    public int getVitrailFaceAverage(int modelId, int face) {
+        return this.cpuFaceColours[modelId * 6 + face];
+    }
+
     private static int multiplyChannel(int left, int right) {
         return (left * right + 127) / 255;
     }
@@ -1084,9 +1096,9 @@ public class ModelFactory {
             boolean written = checkMode == TextureUtils.WRITE_CHECK_STENCIL
                     ? (depths[i] & 0xff) != 0 : pixelAlpha > 1;
             if (!written || pixelAlpha <= 1) continue;
-            red += (long) ((colour >>> 16) & 0xff) * pixelAlpha;
+            red += (long) (colour & 0xff) * pixelAlpha; // Software rasterizer stores ABGR.
             green += (long) ((colour >>> 8) & 0xff) * pixelAlpha;
-            blue += (long) (colour & 0xff) * pixelAlpha;
+            blue += (long) ((colour >>> 16) & 0xff) * pixelAlpha;
             alpha += pixelAlpha;
             weight += pixelAlpha;
         }

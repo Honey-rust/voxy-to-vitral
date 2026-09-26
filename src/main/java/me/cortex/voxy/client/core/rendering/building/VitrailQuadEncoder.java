@@ -4,7 +4,8 @@ import me.cortex.voxy.common.world.WorldEngine;
 
 /** CPU expansion of Voxy's packed 64-bit LOD quad into Vitrail's distant-mesh vertices. */
 public final class VitrailQuadEncoder {
-    public static final int TILE_BLOCKS = 4096;
+    public static final int OPAQUE_TILE_BLOCKS = 4096;
+    public static final int TRANSLUCENT_TILE_BLOCKS = 256;
     private static final double EPSILON = 0.00005;
 
     private VitrailQuadEncoder() {}
@@ -13,7 +14,7 @@ public final class VitrailQuadEncoder {
 
     @FunctionalInterface
     public interface QuadConsumer {
-        /** Receives four vertices belonging to the same 4096-block-aligned Vitrail section. */
+        /** Receives four vertices belonging to one aligned Vitrail section. */
         void accept(int sectionX, int sectionY, int sectionZ, Vertex v0, Vertex v1,
                     Vertex v2, Vertex v3, boolean reverseWinding);
     }
@@ -33,10 +34,16 @@ public final class VitrailQuadEncoder {
      */
     public static void encode(long packed, long nodePosition, int lodLevel, int faceData,
             int colour, int material, QuadConsumer output) {
+        encode(packed, nodePosition, lodLevel, faceData, colour, material, OPAQUE_TILE_BLOCKS, output);
+    }
+
+    public static void encode(long packed, long nodePosition, int lodLevel, int faceData,
+            int colour, int material, int tileBlocks, QuadConsumer output) {
         if (lodLevel < 0 || lodLevel > 30) {
             throw new IllegalArgumentException("Invalid LOD level: " + lodLevel);
         }
         if (output == null) throw new NullPointerException("output");
+        if (tileBlocks <= 0 || tileBlocks > 65535) throw new IllegalArgumentException("Invalid tile size: " + tileBlocks);
 
         int face = (int) (packed & 7L);
         int axis = face >>> 1;
@@ -91,29 +98,29 @@ public final class VitrailQuadEncoder {
         boolean reverse = face == 1 || face == 2 || face == 4;
 
         split(base, firstAxis, secondAxis, firstExtent, secondExtent,
-                light, colour, material, distantFace, reverse, output);
+                light, colour, material, distantFace, reverse, tileBlocks, output);
     }
 
     private static void split(double[] base, int firstAxis, int secondAxis,
             double firstExtent, double secondExtent, int light, int colour, int material,
-            int normal, boolean reverse, QuadConsumer output) {
+            int normal, boolean reverse, int tileBlocks, QuadConsumer output) {
         double firstAt = 0;
         while (firstAt < firstExtent - 1.0e-7) {
             double[] rowBase = base.clone();
             rowBase[firstAxis] += firstAt;
             double firstLength = Math.min(firstExtent - firstAt,
-                    nextTileBoundary(rowBase[firstAxis]) - rowBase[firstAxis]);
+                    nextTileBoundary(rowBase[firstAxis], tileBlocks) - rowBase[firstAxis]);
 
             double secondAt = 0;
             while (secondAt < secondExtent - 1.0e-7) {
                 double[] start = rowBase.clone();
                 start[secondAxis] += secondAt;
                 double secondLength = Math.min(secondExtent - secondAt,
-                        nextTileBoundary(start[secondAxis]) - start[secondAxis]);
+                        nextTileBoundary(start[secondAxis], tileBlocks) - start[secondAxis]);
 
-                int sectionX = Math.floorDiv((int) Math.floor(start[0]), TILE_BLOCKS) * TILE_BLOCKS;
-                int sectionY = Math.floorDiv((int) Math.floor(start[1]), TILE_BLOCKS) * TILE_BLOCKS;
-                int sectionZ = Math.floorDiv((int) Math.floor(start[2]), TILE_BLOCKS) * TILE_BLOCKS;
+                int sectionX = Math.floorDiv((int) Math.floor(start[0]), tileBlocks) * tileBlocks;
+                int sectionY = Math.floorDiv((int) Math.floor(start[1]), tileBlocks) * tileBlocks;
+                int sectionZ = Math.floorDiv((int) Math.floor(start[2]), tileBlocks) * tileBlocks;
                 double[] p0 = start;
                 double[] p1 = start.clone(); p1[firstAxis] += firstLength;
                 double[] p2 = start.clone(); p2[secondAxis] += secondLength;
@@ -136,8 +143,8 @@ public final class VitrailQuadEncoder {
         }
     }
 
-    private static double nextTileBoundary(double coordinate) {
-        return (Math.floor(coordinate / TILE_BLOCKS) + 1.0) * TILE_BLOCKS;
+    private static double nextTileBoundary(double coordinate, int tileBlocks) {
+        return (Math.floor(coordinate / tileBlocks) + 1.0) * tileBlocks;
     }
 
     private static Vertex vertex(double[] point, int sectionX, int sectionY, int sectionZ,

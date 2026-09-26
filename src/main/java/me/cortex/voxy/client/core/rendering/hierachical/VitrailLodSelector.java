@@ -3,13 +3,14 @@ package me.cortex.voxy.client.core.rendering.hierachical;
 import me.cortex.voxy.common.world.WorldEngine;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /** CPU fallback for selecting a non-overlapping Voxy LOD cut when OpenGL compute is unavailable. */
 public final class VitrailLodSelector {
-    private static final double REFINE_DISTANCE_IN_NODE_WIDTHS = 6.0;
+    private static final double REFINE_DISTANCE_IN_NODE_WIDTHS = 4.0;
 
     private VitrailLodSelector() {}
 
@@ -40,6 +41,31 @@ public final class VitrailLodSelector {
             }
         }
         return List.copyOf(selected);
+    }
+
+    /** Finds the currently visible coarse cut that needs child geometry from Voxy. */
+    public static List<Long> refinementRequests(
+            List<NodeManager.GeometryNode> nodes,
+            double cameraX, double cameraZ,
+            double maximumDistanceBlocks) {
+        ArrayList<NodeManager.GeometryNode> candidates = new ArrayList<>();
+        for (NodeManager.GeometryNode node : select(
+                nodes, cameraX, cameraZ, 0.0, maximumDistanceBlocks)) {
+            if (node.level() > 0 && !node.inner() && !node.requestInFlight()
+                    && nodeDistance(node, cameraX, cameraZ)
+                    < 32.0 * (1L << node.level()) * REFINE_DISTANCE_IN_NODE_WIDTHS) {
+                candidates.add(node);
+            }
+        }
+        candidates.sort(Comparator
+                .comparingDouble((NodeManager.GeometryNode node) -> nodeDistance(node, cameraX, cameraZ))
+                .thenComparing(Comparator.comparingInt(NodeManager.GeometryNode::level).reversed()));
+        ArrayList<Long> positions = new ArrayList<>(Math.min(64, candidates.size()));
+        for (NodeManager.GeometryNode node : candidates) {
+            if (positions.size() == 64) break;
+            positions.add(node.position());
+        }
+        return List.copyOf(positions);
     }
 
     private static void selectNode(NodeManager.GeometryNode node,
@@ -93,6 +119,14 @@ public final class VitrailLodSelector {
 
     private static double distanceToInterval(double point, double min, double max) {
         return point < min ? min - point : point > max ? point - max : 0.0;
+    }
+
+    private static double nodeDistance(NodeManager.GeometryNode node, double cameraX, double cameraZ) {
+        double size = 32.0 * (1L << node.level());
+        double minX = (double) WorldEngine.getX(node.position()) * size;
+        double minZ = (double) WorldEngine.getZ(node.position()) * size;
+        return Math.hypot(distanceToInterval(cameraX, minX, minX + size),
+                distanceToInterval(cameraZ, minZ, minZ + size));
     }
 
     private static long parentPosition(long position) {

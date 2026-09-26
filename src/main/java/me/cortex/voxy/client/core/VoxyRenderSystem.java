@@ -309,7 +309,16 @@ public class VoxyRenderSystem {
         if (this.renderDistanceTracker != null) {
             this.renderDistanceTracker.setCenterAndProcess(cameraX, cameraZ);
         }
-        if (this.nodeManager != null) this.nodeManager.tickCpuOnly();
+        if (this.nodeManager != null) {
+            this.nodeManager.tickCpuOnly();
+            double maximumDistance = VoxyConfig.CONFIG.sectionRenderDistance * 16.0 * 32.0;
+            var geometryNodes = this.nodeManager.getCpuGeometryNodesSnapshot();
+            this.nodeManager.synchronizeCpuRefinementRequests(geometryNodes);
+            this.nodeManager.submitCpuRefinementRequests(
+                    me.cortex.voxy.client.core.rendering.hierachical.VitrailLodSelector.refinementRequests(
+                            geometryNodes, cameraX, cameraZ,
+                            maximumDistance));
+        }
         if (this.modelService != null) this.modelService.tick(900_000);
     }
 
@@ -391,6 +400,14 @@ public class VoxyRenderSystem {
             throw new IllegalStateException("Vitrail CPU model data is not available");
         }
         return this.modelService.factory.getVitrailDistantMaterial(modelId);
+    }
+
+    public int[] getVitrailFacePixels(int modelId, int face) {
+        return this.modelService.factory.getVitrailFacePixels(modelId, face);
+    }
+
+    public int getVitrailFaceAverage(int modelId, int face) {
+        return this.modelService.factory.getVitrailFaceAverage(modelId, face);
     }
 
     /** Model/biome tint and Voxy's directional face shade in Vitrail's RGBA byte order. */

@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.rendering.building;
 
 import me.cortex.voxy.common.util.MemoryBuffer;
+import me.cortex.voxy.common.util.UnsafeUtil;
 import me.cortex.voxy.common.world.WorldEngine;
 import org.lwjgl.system.MemoryUtil;
 
@@ -22,14 +23,15 @@ public final class VitrailCpuMeshEncoder {
         int colour(int modelId, int biomeId, int face, boolean opaque);
     }
 
-    /** One opaque or translucent tile; caller owns both buffers and must close the mesh. */
+    /** One opaque or translucent tile; caller owns all three buffers and must close the mesh. */
     public record Mesh(int x, int y, int z, boolean opaque,
                        MemoryBuffer vertices, MemoryBuffer indices,
-                       int vertexCount, int indexCount) implements AutoCloseable {
+                       int vertexCount, int indexCount, MemoryBuffer detail, int atlasPage) implements AutoCloseable {
         @Override
         public void close() {
             this.vertices.free();
             this.indices.free();
+            this.detail.free();
         }
     }
 
@@ -50,6 +52,11 @@ public final class VitrailCpuMeshEncoder {
 
     public static List<Mesh> encode(BuiltSection section, IntBinaryOperator faceDataLookup,
             TintLookup tintLookup, IntUnaryOperator materialLookup, Boolean opaqueOnly) {
+        return encode(section, faceDataLookup, tintLookup, materialLookup, (m, f) -> -1, opaqueOnly);
+    }
+
+    public static List<Mesh> encode(BuiltSection section, IntBinaryOperator faceDataLookup,
+            TintLookup tintLookup, IntUnaryOperator materialLookup, IntBinaryOperator averageLookup, Boolean opaqueOnly) {
         if (section == null || section.isEmpty() || section.geometryBuffer == null) return List.of();
         if (faceDataLookup == null) throw new NullPointerException("faceDataLookup");
         if (tintLookup == null) throw new NullPointerException("tintLookup");
@@ -81,11 +88,14 @@ public final class VitrailCpuMeshEncoder {
                     VitrailQuadEncoder.encode(packed, section.position,
                             WorldEngine.getLevel(section.position), faceData,
                             tintLookup.colour(modelId, biomeId, face, opaque),
-                            materialLookup.applyAsInt(modelId),
+                            materialLookup.applyAsInt(modelId), opaque
+                                    ? VitrailQuadEncoder.OPAQUE_TILE_BLOCKS
+                                    : VitrailQuadEncoder.TRANSLUCENT_TILE_BLOCKS,
                             (sx, sy, sz, v0, v1, v2, v3, reverse) -> {
-                                TileKey key = new TileKey(sx, sy, sz, opaque);
+                                TileKey key = new TileKey(sx, sy, sz, opaque, modelId / 256);
                                 MeshBuilder builder = builders.computeIfAbsent(key, ignored -> new MeshBuilder());
-                                builder.append(v0, v1, v2, v3, reverse);
+                                builder.append(v0, v1, v2, v3, reverse, (modelId % 256) * 6 + face,
+                                        WorldEngine.getLevel(section.position), averageLookup.applyAsInt(modelId, face));
                             });
                 }
             }
@@ -104,21 +114,89 @@ public final class VitrailCpuMeshEncoder {
         }
     }
 
-    private record TileKey(int x, int y, int z, boolean opaque) {}
+    private record TileKey(int x, int y, int z, boolean opaque, int atlasPage) {}
+
+    /** Combines meshes sharing one tile, pass and atlas page into a single draw buffer. */
+    public static Mesh combine(List<Mesh> sources) {
+        if (sources.isEmpty()) throw new IllegalArgumentException("No meshes to combine");
+        Mesh first = sources.getFirst();
+        long vertexBytes = 0;
+        long detailBytes = 0;
+        long indexBytes = 0;
+        int vertexCount = 0;
+        int indexCount = 0;
+        for (Mesh source : sources) {
+            if (source.x() != first.x() || source.y() != first.y() || source.z() != first.z()
+                    || source.opaque() != first.opaque() || source.atlasPage() != first.atlasPage()) {
+                throw new IllegalArgumentException("Cannot combine meshes from different tiles or atlas pages");
+            }
+            vertexBytes = Math.addExact(vertexBytes, source.vertices().size);
+            detailBytes = Math.addExact(detailBytes, source.detail().size);
+            indexBytes = Math.addExact(indexBytes, source.indices().size);
+            vertexCount = Math.addExact(vertexCount, source.vertexCount());
+            indexCount = Math.addExact(indexCount, source.indexCount());
+        }
+        MemoryBuffer vertices = new MemoryBuffer(vertexBytes);
+        MemoryBuffer details = new MemoryBuffer(detailBytes);
+        MemoryBuffer indices = new MemoryBuffer(indexBytes);
+        long vertexOffset = 0;
+        long detailOffset = 0;
+        int writtenIndices = 0;
+        int baseVertex = 0;
+        try {
+            for (Mesh source : sources) {
+                UnsafeUtil.memcpy(source.vertices().address, vertices.address + vertexOffset, source.vertices().size);
+                UnsafeUtil.memcpy(source.detail().address, details.address + detailOffset, source.detail().size);
+                for (int i = 0; i < source.indexCount(); i++) {
+                    int index = MemoryUtil.memGetInt(source.indices().address + (long)i * Integer.BYTES);
+                    MemoryUtil.memPutInt(indices.address + (long)writtenIndices++ * Integer.BYTES,
+                            Math.addExact(index, baseVertex));
+                }
+                vertexOffset += source.vertices().size;
+                detailOffset += source.detail().size;
+                baseVertex = Math.addExact(baseVertex, source.vertexCount());
+            }
+            return new Mesh(first.x(), first.y(), first.z(), first.opaque(),
+                    vertices, indices, vertexCount, indexCount, details, first.atlasPage());
+        } catch (RuntimeException | Error e) {
+            vertices.free();
+            indices.free();
+            details.free();
+            throw e;
+        }
+    }
 
     private static final class MeshBuilder {
         private MemoryBuffer vertices = new MemoryBuffer(1024);
         private MemoryBuffer indices = new MemoryBuffer(1536);
+        private MemoryBuffer detail = new MemoryBuffer(1024);
         private int vertexCount;
         private int indexCount;
 
         void append(VitrailQuadEncoder.Vertex v0, VitrailQuadEncoder.Vertex v1,
-                VitrailQuadEncoder.Vertex v2, VitrailQuadEncoder.Vertex v3, boolean reverse) {
+                VitrailQuadEncoder.Vertex v2, VitrailQuadEncoder.Vertex v3, boolean reverse,
+                int tile, int lod, int average) {
             ensureVertexCapacity(vertexCount + 4);
             ensureIndexCapacity(indexCount + 6);
             long ptr = vertices.address + (long) vertexCount * VERTEX_STRIDE;
             writeVertex(ptr, v0); writeVertex(ptr + VERTEX_STRIDE, v1);
             writeVertex(ptr + VERTEX_STRIDE * 2L, v2); writeVertex(ptr + VERTEX_STRIDE * 3L, v3);
+            VitrailQuadEncoder.Vertex[] corners = {v0, v1, v2, v3};
+            for (int i = 0; i < 4; i++) {
+                var v = corners[i];
+                int axis = v.normal() >> 1;
+                float scale = 1 << lod;
+                float u = (axis == 2 ? v.y() : v.x()) / scale;
+                float w = (axis == 1 ? v.y() : v.z()) / scale;
+                long d = detail.address + (long)(vertexCount + i) * 16;
+                MemoryUtil.memPutFloat(d, u);
+                MemoryUtil.memPutFloat(d + 4, w);
+                MemoryUtil.memPutInt(d + 8, tile);
+                MemoryUtil.memPutByte(d + 12, (byte)(average >>> 16));
+                MemoryUtil.memPutByte(d + 13, (byte)(average >>> 8));
+                MemoryUtil.memPutByte(d + 14, (byte)average);
+                MemoryUtil.memPutByte(d + 15, (byte)(average >>> 24));
+            }
 
             int base = vertexCount;
             if (reverse) {
@@ -134,13 +212,15 @@ public final class VitrailCpuMeshEncoder {
         Mesh finish(TileKey key) {
             MemoryBuffer exactVertices = this.vertices.subSize((long) vertexCount * VERTEX_STRIDE);
             this.vertices = null;
+            MemoryBuffer exactIndices = null;
             try {
-                MemoryBuffer exactIndices = this.indices.subSize((long) indexCount * Integer.BYTES);
+                exactIndices = this.indices.subSize((long) indexCount * Integer.BYTES);
                 this.indices = null;
                 return new Mesh(key.x, key.y, key.z, key.opaque,
-                        exactVertices, exactIndices, vertexCount, indexCount);
+                        exactVertices, exactIndices, vertexCount, indexCount, takeDetail(), key.atlasPage);
             } catch (RuntimeException | Error e) {
                 exactVertices.free();
+                if (exactIndices != null) exactIndices.free();
                 throw e;
             }
         }
@@ -148,6 +228,13 @@ public final class VitrailCpuMeshEncoder {
         void free() {
             if (this.vertices != null) this.vertices.free();
             if (this.indices != null) this.indices.free();
+            if (this.detail != null) this.detail.free();
+        }
+
+        private MemoryBuffer takeDetail() {
+            MemoryBuffer result = this.detail.subSize((long)vertexCount * 16);
+            this.detail = null;
+            return result;
         }
 
         private void ensureVertexCapacity(int requiredVertices) {
@@ -158,6 +245,10 @@ public final class VitrailCpuMeshEncoder {
             this.vertices.cpyTo(expanded.address);
             this.vertices.free();
             this.vertices = expanded;
+            MemoryBuffer expandedDetail = new MemoryBuffer(capacity);
+            this.detail.cpyTo(expandedDetail.address);
+            this.detail.free();
+            this.detail = expandedDetail;
         }
 
         private void ensureIndexCapacity(int requiredIndices) {

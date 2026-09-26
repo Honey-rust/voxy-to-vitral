@@ -94,7 +94,7 @@ public class NodeManager {
 
     /** Geometry-bearing nodes copied on the manager thread for CPU renderer traversal. */
     public record GeometryNode(long position, int geometryId, long geometryVersion, int level,
-                               byte childExistence, boolean inner) {}
+                               byte childExistence, boolean inner, boolean requestInFlight) {}
 
     public List<GeometryNode> snapshotGeometryNodes() {
         ArrayList<GeometryNode> snapshot = new ArrayList<>();
@@ -109,7 +109,7 @@ public class NodeManager {
                     ? cpuManager.getCpuSectionVersion(geometryId) : 0;
             snapshot.add(new GeometryNode(position, geometryId, version,
                     WorldEngine.getLevel(position), this.nodeData.getNodeChildExistence(nodeId),
-                    type == NODE_TYPE_INNER));
+                    type == NODE_TYPE_INNER, this.nodeData.isNodeRequestInFlight(nodeId)));
         }
         return List.copyOf(snapshot);
     }
