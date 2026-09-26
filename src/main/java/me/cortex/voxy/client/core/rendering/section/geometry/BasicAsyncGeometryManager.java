@@ -2,6 +2,7 @@ package me.cortex.voxy.client.core.rendering.section.geometry;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.common.util.AllocationArena;
@@ -28,12 +29,21 @@ public class BasicAsyncGeometryManager implements IGeometryManager {
     //Note!: the int part is an unsigned int ptr, must be scaled by GEOMETRY_ELEMENT_SIZE
     private final Int2ObjectOpenHashMap<MemoryBuffer> heapUploads = new Int2ObjectOpenHashMap<>(1024);//Uploads into the buffer at the given location
     private final IntOpenHashSet heapRemoveUploads = new IntOpenHashSet(1024);//Any removals are added here, so that it can be properly synced
+    private final boolean retainCpuSections;
+    private final Int2ObjectOpenHashMap<BuiltSection> cpuSections = new Int2ObjectOpenHashMap<>();
+    private final Int2LongOpenHashMap cpuSectionVersions = new Int2LongOpenHashMap();
+    private long nextCpuSectionVersion = 1;
     private long usedCapacity = 0;
 
     public BasicAsyncGeometryManager(int maxSectionCount, long geometryCapacity) {
+        this(maxSectionCount, geometryCapacity, false);
+    }
+
+    public BasicAsyncGeometryManager(int maxSectionCount, long geometryCapacity, boolean retainCpuSections) {
         this.allocationSet = new HierarchicalBitSet(maxSectionCount);
         if (geometryCapacity%GEOMETRY_ELEMENT_SIZE != 0)  throw new IllegalStateException();
         this.allocationHeap.setLimit(geometryCapacity/GEOMETRY_ELEMENT_SIZE);
+        this.retainCpuSections = retainCpuSections;
     }
 
     @Override
@@ -42,7 +52,7 @@ public class BasicAsyncGeometryManager implements IGeometryManager {
     }
 
     @Override
-    public int uploadReplaceSection(int oldId, BuiltSection section) {
+    public synchronized int uploadReplaceSection(int oldId, BuiltSection section) {
         if (section.isEmpty()) {
             throw new IllegalArgumentException("sectionData is empty, cannot upload nothing");
         }
@@ -72,6 +82,11 @@ public class BasicAsyncGeometryManager implements IGeometryManager {
 
         var newMeta = this.createMeta(section);
 
+        if (this.retainCpuSections) {
+            this.cpuSections.put(newId, section.clone());
+            this.cpuSectionVersions.put(newId, this.nextCpuSectionVersion++);
+        }
+
         if (newId == this.sectionMetadata.size()) {
             this.sectionMetadata.add(newMeta);
         } else {
@@ -88,11 +103,14 @@ public class BasicAsyncGeometryManager implements IGeometryManager {
     }
 
     @Override
-    public void removeSection(int id) {
+    public synchronized void removeSection(int id) {
         if (!this.allocationSet.free(id)) {
             throw new IllegalStateException("Id was not already allocated. id: " + id);
         }
         var oldMetadata = this.sectionMetadata.set(id, null);
+        BuiltSection cpuSection = this.cpuSections.remove(id);
+        this.cpuSectionVersions.remove(id);
+        if (cpuSection != null) cpuSection.free();
         int ptr = oldMetadata.geometryPtr;
         //Free from the heap
         this.usedCapacity -= this.allocationHeap.free(Integer.toUnsignedLong(ptr));
@@ -148,6 +166,29 @@ public class BasicAsyncGeometryManager implements IGeometryManager {
 
     public IntOpenHashSet getUpdateIds() {
         return this.invalidatedIds;
+    }
+
+    /** Returns independent section copies for Vulkan-side CPU conversion; caller owns and frees them. */
+    public synchronized ObjectArrayList<BuiltSection> getCpuSectionsSnapshot() {
+        ObjectArrayList<BuiltSection> sections = new ObjectArrayList<>(this.cpuSections.size());
+        for (BuiltSection section : this.cpuSections.values()) sections.add(section.clone());
+        return sections;
+    }
+
+    /** Returns an independent copy of one retained section, or null if it has been removed. */
+    public synchronized BuiltSection getCpuSectionSnapshot(int geometryId) {
+        BuiltSection section = this.cpuSections.get(geometryId);
+        return section == null ? null : section.clone();
+    }
+
+    public synchronized long getCpuSectionVersion(int geometryId) {
+        return this.cpuSectionVersions.get(geometryId);
+    }
+
+    public synchronized void freeRetainedCpuSections() {
+        for (BuiltSection section : this.cpuSections.values()) section.free();
+        this.cpuSections.clear();
+        this.cpuSectionVersions.clear();
     }
 
     public void writeMetadata(int sectionId, long ptr) {

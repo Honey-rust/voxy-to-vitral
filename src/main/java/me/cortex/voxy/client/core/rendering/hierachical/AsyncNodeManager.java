@@ -65,6 +65,7 @@ public class AsyncNodeManager {
     private final long geometryCapacity;
     private volatile boolean running = true;
     private volatile Throwable uncaughtException;
+    private volatile List<NodeManager.GeometryNode> cpuGeometryNodes = List.of();
 
     private final NodeManager manager;
     private final BasicAsyncGeometryManager geometryManager;
@@ -115,7 +116,9 @@ public class AsyncNodeManager {
         });
         this.thread.setName("Async Node Manager");
 
-        this.geometryManager = new BasicAsyncGeometryManager(((BasicSectionGeometryData)geometryData).getMaxSectionCount(), this.geometryCapacity);
+        this.geometryManager = new BasicAsyncGeometryManager(
+                ((BasicSectionGeometryData) geometryData).getMaxSectionCount(), this.geometryCapacity,
+                me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive());
 
         this.router = new SectionUpdateRouter();
         this.router.setCallbacks(pos->{//On initial render gen, try get from geometry cache
@@ -494,6 +497,9 @@ public class AsyncNodeManager {
         results.geometrySectionCount = this.geometryManager.getSectionCount();
         results.usedGeometry = this.geometryManager.getGeometryUsedBytes();
         results.currentMaxNodeId = this.manager.getCurrentMaxNodeId();
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            this.cpuGeometryNodes = this.manager.snapshotGeometryNodes();
+        }
 
         this.needsWaitForSync |= results.geometryUpload.currentElemCopyAmount*8L > 2L<<20;//2mb limit per frame
         this.needsWaitForSync |= results.cleanerOperations.size() > 1024;
@@ -608,6 +614,29 @@ public class AsyncNodeManager {
         }
     }
 
+    /**
+     * Consumes the worker's publication without issuing OpenGL work. The Vulkan path owns a CPU
+     * mirror of section geometry and keeps the authoritative node graph in {@link NodeManager};
+     * these deltas exist only to synchronize the OpenGL traversal buffers.
+     */
+    public void tickCpuOnly() {
+        if (this.uncaughtException != null) throw new RuntimeException(this.uncaughtException);
+        var results = (SyncResults) RESULT_HANDLE.getAndSet(this, null);
+        if (results == null) return;
+
+        if (!RESULT_CACHE_1_HANDLE.compareAndSet(this, null, results)
+                && !RESULT_CACHE_2_HANDLE.compareAndSet(this, null, results)) {
+            RESULT_HANDLE.compareAndSet(this, null, results);
+            throw new IllegalStateException("No free synchronization result slot for CPU backend");
+        }
+        // Keep the shared debug counters current without touching the OpenGL traversal buffers.
+        this.currentMaxNodeId = results.currentMaxNodeId;
+        this.usedGeometryAmount = results.usedGeometry;
+        if (this.geometryData instanceof BasicSectionGeometryData basicGeometry) {
+            basicGeometry.setSectionCount(results.geometrySectionCount);
+        }
+    }
+
 
     public void setTLNAddRemoveCallbacks(IntConsumer add, IntConsumer remove) {
         this.tlnAddCallback = add;
@@ -626,6 +655,19 @@ public class AsyncNodeManager {
 
     public long getGeometryCapacity() {
         return this.geometryCapacity;
+    }
+
+    /** Returns independent CPU copies of current sections; caller owns and must free them. */
+    public List<BuiltSection> getCpuSectionsSnapshot() {
+        return this.geometryManager.getCpuSectionsSnapshot();
+    }
+
+    public BuiltSection getCpuSectionSnapshot(int geometryId) {
+        return this.geometryManager.getCpuSectionSnapshot(geometryId);
+    }
+
+    public List<NodeManager.GeometryNode> getCpuGeometryNodesSnapshot() {
+        return this.cpuGeometryNodes;
     }
 
 
@@ -783,6 +825,7 @@ public class AsyncNodeManager {
         this.scatterWrite.free();
         this.multiMemcpy.free();
         this.geometryCache.free();
+        this.geometryManager.freeRetainedCpuSections();
     }
 
     public void addDebug(List<String> debug) {

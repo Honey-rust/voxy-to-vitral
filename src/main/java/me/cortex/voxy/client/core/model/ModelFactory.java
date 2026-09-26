@@ -20,8 +20,10 @@ import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.CardinalLighting;
 import net.minecraft.world.level.ColorResolver;
 import net.minecraft.world.level.LightLayer;
@@ -65,9 +67,9 @@ public class ModelFactory {
 
     //TODO: replace the fluid BlockState with a client model id integer of the fluidState, requires looking up
     // the fluid state in the mipper
-    private record ModelEntry(ColourDepthTextureData down, ColourDepthTextureData up, ColourDepthTextureData north, ColourDepthTextureData south, ColourDepthTextureData west, ColourDepthTextureData east, int fluidBlockStateId, int tintingColour) {
-        public ModelEntry(ColourDepthTextureData[] textures, int fluidBlockStateId, int tintingColour) {
-            this(textures[0], textures[1], textures[2], textures[3], textures[4], textures[5], fluidBlockStateId, tintingColour);
+    private record ModelEntry(ColourDepthTextureData down, ColourDepthTextureData up, ColourDepthTextureData north, ColourDepthTextureData south, ColourDepthTextureData west, ColourDepthTextureData east, int fluidBlockStateId, int tintingColour, int distantMaterial) {
+        public ModelEntry(ColourDepthTextureData[] textures, int fluidBlockStateId, int tintingColour, int distantMaterial) {
+            this(textures[0], textures[1], textures[2], textures[3], textures[4], textures[5], fluidBlockStateId, tintingColour, distantMaterial);
         }
     }
 
@@ -105,6 +107,11 @@ public class ModelFactory {
 
     // this has an issue with scaffolding i believe tho, so maybe make it a probability to render??? idk
     private final long[] metadataCache;
+    /** CPU mirror of the 64-byte model records uploaded to the OpenGL SSBO. */
+    private final MemoryBuffer cpuModelData = new MemoryBuffer((long) MODEL_SIZE * (1 << 16)).zero();
+    private int[] cpuBiomeColours = new int[0];
+    private final int[] cpuFaceColours = new int[(1 << 16) * 6];
+    private final int[] cpuDistantMaterials = new int[1 << 16];
     private final int[] fluidStateLUT;
 
     //Provides a map from id -> model id as multiple ids might have the same internal model id
@@ -324,6 +331,16 @@ public class ModelFactory {
     }
 
     public void processUploads() {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            // The bake results already copied model records and biome colours into the CPU mirrors.
+            // Vulkan has no current OpenGL context, so release the GL-only upload payloads here.
+            ResultUploader upload;
+            while ((upload = this.uploadResults.poll()) != null) {
+                upload.free();
+            }
+            return;
+        }
+
         var upload = this.uploadResults.poll();
         if (upload==null) return;
 
@@ -435,7 +452,11 @@ public class ModelFactory {
 
         ModelEntry entry;
         {//Deduplicate same entries
-            entry = new ModelEntry(textureData, clientFluidStateId, isBiomeColourDependent||tintSources==null?-1:captureColourConstant(tintSources, blockState, DEFAULT_BIOME)|0xFF000000);
+            int distantMaterial = me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()
+                    ? getDistantMaterial(blockState) : 0;
+            entry = new ModelEntry(textureData, clientFluidStateId,
+                    isBiomeColourDependent||tintSources==null?-1:captureColourConstant(tintSources, blockState, DEFAULT_BIOME)|0xFF000000,
+                    distantMaterial);
             int possibleDuplicate = this.modelTexture2id.getInt(entry);
             if (possibleDuplicate != -1) {//Duplicate found
                 this.idMappings[blockId] = possibleDuplicate;
@@ -453,6 +474,7 @@ public class ModelFactory {
                 //NOTE: we set the mapping at the very end so that race conditions with this and getMetadata dont occur
                 //this.idMappings[blockId] = modelId;
                 this.modelTexture2id.put(entry, modelId);
+                this.cpuDistantMaterials[modelId] = distantMaterial;
             }
         }
 
@@ -464,9 +486,9 @@ public class ModelFactory {
 
 
         int checkMode = layer==ChunkSectionLayer.SOLID?TextureUtils.WRITE_CHECK_STENCIL:TextureUtils.WRITE_CHECK_ALPHA;
-
-
-
+        for (int face = 0; face < 6; face++) {
+            this.cpuFaceColours[modelId * 6 + face] = averageFaceColour(textureData[face], checkMode);
+        }
 
         ModelBakeResultUpload uploadResult = new ModelBakeResultUpload(!this.rasterUV);
         uploadResult.modelId = modelId;
@@ -662,8 +684,12 @@ public class ModelFactory {
             if (!this.biomes.isEmpty()) {
                 uploadResult.biomeUploadIndex = biomeIndex;
                 long clrUploadPtr = (uploadResult.biomeUpload = new MemoryBuffer(4L * this.biomes.size())).address;
-                for (var biome : this.biomes) {
-                    MemoryUtil.memPutInt(clrUploadPtr, captureColourConstant(tintSources, blockState, biome) | 0xFF000000); clrUploadPtr += 4;
+                for (int biomeId = 0; biomeId < this.biomes.size(); biomeId++) {
+                    var biome = this.biomes.get(biomeId);
+                    int colour = biome == null ? 0xffff_ffff
+                            : captureColourConstant(tintSources, blockState, biome) | 0xff00_0000;
+                    MemoryUtil.memPutInt(clrUploadPtr, colour); clrUploadPtr += 4;
+                    this.setCpuBiomeColour(biomeIndex + biomeId, colour);
                 }
             }
         }
@@ -688,6 +714,11 @@ public class ModelFactory {
             MipGen.putTextures(darkenedTinting, textureData, uploadResult.texture);
 
         //glGenerateTextureMipmap(this.textures.id);
+
+        // Retain the model record on the CPU as well. Vulkan renderers cannot read the OpenGL SSBO,
+        // and Vitrail's far-terrain adapter needs the per-face extents and indentation to expand
+        // Voxy's packed quads into regular vertices.
+        uploadResult.model.cpyTo(this.cpuModelData.address + (long) modelId * MODEL_SIZE);
 
         //Set the mapping at the very end
         this.idMappings[blockId] = modelId;
@@ -774,13 +805,20 @@ public class ModelFactory {
             }
             //Populate the list of biomes for the model state
             int biomeIndex = (i++) * this.biomes.size();
+            MemoryUtil.memPutInt(this.cpuModelData.address + (long) entry.model * MODEL_SIZE + 28, biomeIndex);
             MemoryUtil.memPutLong(modelUpPtr, Integer.toUnsignedLong(entry.model)|(Integer.toUnsignedLong(biomeIndex)<<32));modelUpPtr+=8;
             long clrUploadPtr = result.biomeColourBuffer.address + biomeIndex * 4L;
-            for (var biomeE : this.biomes) {
+            for (int biomeId = 0; biomeId < this.biomes.size(); biomeId++) {
+                var biomeE = this.biomes.get(biomeId);
                 if (biomeE == null) {
+                    MemoryUtil.memPutInt(clrUploadPtr, 0xffff_ffff);
+                    clrUploadPtr += 4;
+                    this.setCpuBiomeColour(biomeIndex + biomeId, 0xffff_ffff);
                     continue;//If null, ignore
                 }
-                MemoryUtil.memPutInt(clrUploadPtr, captureColourConstant(colourProvider, entry.state, biomeE)|0xFF000000); clrUploadPtr += 4;
+                int colour = captureColourConstant(colourProvider, entry.state, biomeE)|0xFF000000;
+                MemoryUtil.memPutInt(clrUploadPtr, colour); clrUploadPtr += 4;
+                this.setCpuBiomeColour(biomeIndex + biomeId, colour);
             }
         }
 
@@ -969,10 +1007,118 @@ public class ModelFactory {
         return this.metadataCache[clientId];
     }
 
+    /** Returns the packed per-face model data used by Voxy's LOD vertex shader. */
+    public int getFaceData(int modelId, int face) {
+        if (modelId < 0 || modelId >= (1 << 16) || face < 0 || face >= 6) {
+            throw new IndexOutOfBoundsException("modelId=" + modelId + ", face=" + face);
+        }
+        return MemoryUtil.memGetInt(this.cpuModelData.address + (long) modelId * MODEL_SIZE + face * 4L);
+    }
+
+    /** Returns the Distant Horizons mini-ID written into Vitrail's distant vertex material. */
+    public int getVitrailDistantMaterial(int modelId) {
+        if (modelId < 0 || modelId >= this.cpuDistantMaterials.length) {
+            throw new IndexOutOfBoundsException("modelId=" + modelId);
+        }
+        return this.cpuDistantMaterials[modelId];
+    }
+
+    private static int getDistantMaterial(BlockState state) {
+        if (state.isAir()) return 14; // DH_BLOCK_AIR
+        if (state.getBlock() instanceof LiquidBlock) {
+            var fluid = state.getFluidState();
+            if (fluid.is(FluidTags.WATER)) return 12; // DH_BLOCK_WATER
+            if (fluid.is(FluidTags.LAVA)) return 6; // DH_BLOCK_LAVA
+        }
+        if (state.is(BlockTags.LEAVES)) return 1; // DH_BLOCK_LEAVES
+
+        String path = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
+        if (path.startsWith("deepslate")) return 7; // DH_BLOCK_DEEPSLATE
+        if (path.contains("netherrack") || path.contains("basalt") || path.contains("blackstone")) return 11; // DH_BLOCK_NETHER_STONE
+        if (path.contains("sand")) return 9; // DH_BLOCK_SAND
+        if (path.contains("terracotta")) return 10; // DH_BLOCK_TERRACOTTA
+        if (path.contains("snow")) return 8; // DH_BLOCK_SNOW
+        if (path.contains("grass_block")) return 13; // DH_BLOCK_GRASS
+        if (state.is(BlockTags.DIRT) || path.contains("podzol") || path.contains("coarse_dirt")) return 5; // DH_BLOCK_DIRT
+        if (state.is(BlockTags.LOGS) || state.is(BlockTags.PLANKS)
+                || path.contains("_wood") || path.contains("_log") || path.contains("planks")) return 3; // DH_BLOCK_WOOD
+        if (path.contains("iron") || path.contains("copper") || path.contains("gold")
+                || path.contains("netherite") || path.contains("anvil")) return 4; // DH_BLOCK_METAL
+        if (path.contains("stone") || path.contains("ore") || path.contains("cobble")) return 2; // DH_BLOCK_STONE
+        if (state.getLightEmission() > 0) return 15; // DH_BLOCK_ILLUMINATED
+        return 0; // DH_BLOCK_UNKNOWN
+    }
+
+    /** Average baked face colour multiplied by the model or biome tint, returned as RGBA. */
+    public int getVitrailFaceColour(int modelId, int biomeId, int face, boolean opaque) {
+        if (modelId < 0 || modelId >= (1 << 16) || face < 0 || face >= 6) {
+            throw new IndexOutOfBoundsException("modelId=" + modelId + ", face=" + face);
+        }
+        int texture = this.cpuFaceColours[modelId * 6 + face];
+        int tint = MemoryUtil.memGetInt(this.cpuModelData.address + (long) modelId * MODEL_SIZE + 28);
+        int flags = MemoryUtil.memGetInt(this.cpuModelData.address + (long) modelId * MODEL_SIZE + 24);
+        if ((flags & 2) != 0) {
+            long index = Integer.toUnsignedLong(tint) + biomeId;
+            tint = biomeId < 0 || index >= this.cpuBiomeColours.length
+                    ? 0xffff_ffff : this.cpuBiomeColours[(int) index];
+        }
+        if (tint == -1) tint = 0xffff_ffff;
+        int alpha = opaque ? 255 : multiplyChannel(texture >>> 24, tint >>> 24);
+        int red = multiplyChannel((texture >>> 16) & 0xff, (tint >>> 16) & 0xff);
+        int green = multiplyChannel((texture >>> 8) & 0xff, (tint >>> 8) & 0xff);
+        int blue = multiplyChannel(texture & 0xff, tint & 0xff);
+        return (red << 24) | (green << 16) | (blue << 8) | alpha;
+    }
+
+    private static int multiplyChannel(int left, int right) {
+        return (left * right + 127) / 255;
+    }
+
+    private static int averageFaceColour(ColourDepthTextureData texture, int checkMode) {
+        long red = 0, green = 0, blue = 0, alpha = 0, weight = 0;
+        int[] colours = texture.colour();
+        int[] depths = texture.depth();
+        for (int i = 0; i < colours.length; i++) {
+            int colour = colours[i];
+            int pixelAlpha = colour >>> 24;
+            boolean written = checkMode == TextureUtils.WRITE_CHECK_STENCIL
+                    ? (depths[i] & 0xff) != 0 : pixelAlpha > 1;
+            if (!written || pixelAlpha <= 1) continue;
+            red += (long) ((colour >>> 16) & 0xff) * pixelAlpha;
+            green += (long) ((colour >>> 8) & 0xff) * pixelAlpha;
+            blue += (long) (colour & 0xff) * pixelAlpha;
+            alpha += pixelAlpha;
+            weight += pixelAlpha;
+        }
+        if (weight == 0) return 0xffff_ffff;
+        int r = (int) ((red + weight / 2) / weight);
+        int g = (int) ((green + weight / 2) / weight);
+        int b = (int) ((blue + weight / 2) / weight);
+        int a = (int) ((alpha + colours.length / 2) / colours.length);
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    public boolean isModelShaded(int modelId) {
+        if (modelId < 0 || modelId >= (1 << 16)) {
+            throw new IndexOutOfBoundsException("modelId=" + modelId);
+        }
+        return (MemoryUtil.memGetInt(this.cpuModelData.address + (long) modelId * MODEL_SIZE + 24) & 8) != 0;
+    }
+
+    private void setCpuBiomeColour(int index, int colour) {
+        if (index < 0) throw new IndexOutOfBoundsException("biome colour index=" + index);
+        if (index >= this.cpuBiomeColours.length) {
+            this.cpuBiomeColours = java.util.Arrays.copyOf(this.cpuBiomeColours,
+                    Math.max(index + 1, Math.max(16, this.cpuBiomeColours.length * 2)));
+        }
+        this.cpuBiomeColours[index] = colour;
+    }
+
 
     public void free() {
         this.bakery2.free();
         MemoryUtil.nmemFree(this.bakeScratchBuffer);
+        this.cpuModelData.free();
         while (!this.uploadResults.isEmpty()) {
             this.uploadResults.poll().free();
         }

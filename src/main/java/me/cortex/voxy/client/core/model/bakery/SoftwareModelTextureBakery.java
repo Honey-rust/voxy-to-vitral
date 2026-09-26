@@ -72,7 +72,7 @@ public class SoftwareModelTextureBakery {
         var texture = new int[width * height];
 
         // 在非 Vulkan / 原生 OpenGL 环境下正常走 OpenGL 回读
-        if (tex instanceof GlTexture glTex && !FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (tex instanceof GlTexture glTex && !me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             glFlush();
             glFinish();
             glBindFramebuffer(GL_FRAMEBUFFER, 0);

@@ -43,7 +43,7 @@ public class GlBuffer extends TrackedObject {
         this.size = size;
 
         // === Vitrail (Vulkan) 模式：赋予虚拟缓冲句柄，不执行原生 GL 指令 ===
-        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             this.id = 0;
             COUNT++;
             TOTAL_SIZE += size;
@@ -63,7 +63,7 @@ public class GlBuffer extends TrackedObject {
     @Override
     public void free() {
         this.free0();
-        if (!net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             glDeleteBuffers(this.id);
         }
 
@@ -80,21 +80,21 @@ public class GlBuffer extends TrackedObject {
     }
 
     public GlBuffer zero() {
-        if (!net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             nglClearNamedBufferData(this.id, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 0);
         }
         return this;
     }
 
     public GlBuffer zeroRange(long offset, long size) {
-        if (!net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             nglClearNamedBufferSubData(this.id, GL_R8UI, offset, size, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 0);
         }
         return this;
     }
 
     public GlBuffer fill(int data) {
-        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return this;
         }
         //Clear unpack values
@@ -116,7 +116,7 @@ public class GlBuffer extends TrackedObject {
     }
 
     public GlBuffer name(String name) {
-        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return this;
         }
         return GlDebug.name(name, this);

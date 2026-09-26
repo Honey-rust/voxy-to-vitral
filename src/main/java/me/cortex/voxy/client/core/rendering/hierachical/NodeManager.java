@@ -9,6 +9,7 @@ import it.unimi.dsi.fastutil.longs.LongSet;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.rendering.ISectionWatcher;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
+import me.cortex.voxy.client.core.rendering.section.geometry.BasicAsyncGeometryManager;
 import me.cortex.voxy.client.core.rendering.section.geometry.IGeometryManager;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.client.core.util.ExpandingObjectAllocationList;
@@ -18,6 +19,7 @@ import me.cortex.voxy.common.world.WorldEngine;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.List;
+import java.util.ArrayList;
 
 import static me.cortex.voxy.common.world.WorldEngine.MAX_LOD_LAYER;
 import static me.cortex.voxy.common.world.WorldEngine.UPDATE_TYPE_BLOCK_BIT;
@@ -89,6 +91,28 @@ public class NodeManager {
     private final IntOpenHashSet topLevelNodeIds = new IntOpenHashSet();
     private final LongOpenHashSet topLevelNodes = new LongOpenHashSet();
     private int activeNodeRequestCount;
+
+    /** Geometry-bearing nodes copied on the manager thread for CPU renderer traversal. */
+    public record GeometryNode(long position, int geometryId, long geometryVersion, int level,
+                               byte childExistence, boolean inner) {}
+
+    public List<GeometryNode> snapshotGeometryNodes() {
+        ArrayList<GeometryNode> snapshot = new ArrayList<>();
+        for (var entry : this.activeSectionMap.long2IntEntrySet()) {
+            int encodedNode = entry.getIntValue();
+            int type = encodedNode & NODE_TYPE_MSK;
+            if (type == NODE_TYPE_REQUEST) continue;
+            int nodeId = encodedNode & NODE_ID_MSK;
+            int geometryId = this.nodeData.getNodeGeometry(nodeId);
+            long position = entry.getLongKey();
+            long version = this.geometryManager instanceof BasicAsyncGeometryManager cpuManager
+                    ? cpuManager.getCpuSectionVersion(geometryId) : 0;
+            snapshot.add(new GeometryNode(position, geometryId, version,
+                    WorldEngine.getLevel(position), this.nodeData.getNodeChildExistence(nodeId),
+                    type == NODE_TYPE_INNER));
+        }
+        return List.copyOf(snapshot);
+    }
 
     private IntConsumer topLevelNodeIdAddedCallback;
     private IntConsumer topLevelNodeIdRemovedCallback;

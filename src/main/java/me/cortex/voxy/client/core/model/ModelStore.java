@@ -32,7 +32,7 @@ public class ModelStore {
     public final int blockSampler;
 
     public ModelStore() {
-        boolean isVitrail = FabricLoader.getInstance().isModLoaded("vitrail");
+        boolean isVitrail = me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive();
         this.blockSampler = isVitrail ? 0 : glGenSamplers();
 
         this.modelBuffer = new GlBuffer(MODEL_SIZE * (1<<16)).name("ModelData");
@@ -57,13 +57,13 @@ public class ModelStore {
         this.modelBuffer.free();
         this.modelColourBuffer.free();
         this.ref.clean();
-        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             glDeleteSamplers(this.blockSampler);
         }
     }
 
     public void bind(int modelBindingIndex, int colourBindingIndex, int textureBindingIndex) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return;
         }
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, modelBindingIndex, this.modelBuffer.id);

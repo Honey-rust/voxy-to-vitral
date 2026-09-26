@@ -80,7 +80,7 @@ public class BasicSectionGeometryData implements IGeometryData {
 
     private long sparseCommitment = 0;//Tracks the current range of the allocated sparse buffer
     public void ensureAccessable(int maxElementAccess) {
-        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return;
         }
 
@@ -126,7 +126,7 @@ public class BasicSectionGeometryData implements IGeometryData {
     public void free() {
         this.sectionMetadataBuffer.free();
 
-        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             if (!this.isExternalGeometryBuffer) {
                 this.geometryBuffer.free();
             }

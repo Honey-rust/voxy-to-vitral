@@ -75,9 +75,20 @@ public class VoxyRenderSystem {
 
     private final AbstractRenderPipeline pipeline;
     private final RenderProperties properties;
+    private volatile double vitrailCameraX;
+    private volatile double vitrailCameraZ;
 
     private static AbstractSectionRenderer.Factory<?,? extends IGeometryData> getRenderBackendFactory() {
         return MDICSectionRenderer.FACTORY;
+    }
+
+    public record VitrailVisibleSection(
+            me.cortex.voxy.client.core.rendering.hierachical.NodeManager.GeometryNode node,
+            me.cortex.voxy.client.core.rendering.building.BuiltSection geometry) implements AutoCloseable {
+        @Override
+        public void close() {
+            this.geometry.free();
+        }
     }
 
     public VoxyRenderSystem(WorldEngine world, ServiceManager sm) {
@@ -92,7 +103,7 @@ public class VoxyRenderSystem {
             Minecraft.getInstance().gui.chatListener().handleSystemMessage(Component.literal(msg), false);
         }
 
-        boolean isVitrail = FabricLoader.getInstance().isModLoaded("vitrail");
+        boolean isVitrail = me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive();
 
         // === Vitrail (Vulkan) 模式：启动纯 CPU 后台多线程数据生成引擎，跳过 OpenGL 着色器管线 ===
         if (isVitrail) {
@@ -146,7 +157,8 @@ public class VoxyRenderSystem {
             this.pipeline = null;
             this.viewportSelector = null;
             this.boundOutlineRenderer = null;
-            Logger.info("Voxy render system: Vitrail (Vulkan) LOD background engine successfully started!");
+            VitrailBridge.registerProvider(this);
+            Logger.info("Vitrail Vulkan detected: Voxy's CPU LOD provider is connected to Vitrail's distant-terrain pass.");
             return;
         }
 
@@ -236,13 +248,8 @@ public class VoxyRenderSystem {
     }
 
     public Viewport<?> setupViewport(Matrix4fc vanillaProjection, Matrix4fc modelView, FogParameters fogParameters, int width, int height, double cameraX, double cameraY, double cameraZ) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
-            if (this.renderDistanceTracker != null) {
-                this.renderDistanceTracker.setCenterAndProcess(cameraX, cameraZ);
-            }
-            if (this.modelService != null) {
-                this.modelService.tick(900_000);
-            }
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            this.tickVitrail(cameraX, cameraZ);
             return null;
         }
 
@@ -294,8 +301,122 @@ public class VoxyRenderSystem {
         return viewport;
     }
 
+    /** Advances Voxy's CPU-only world and geometry queues from the Vulkan terrain stage. */
+    public void tickVitrail(double cameraX, double cameraZ) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) return;
+        this.vitrailCameraX = cameraX;
+        this.vitrailCameraZ = cameraZ;
+        if (this.renderDistanceTracker != null) {
+            this.renderDistanceTracker.setCenterAndProcess(cameraX, cameraZ);
+        }
+        if (this.nodeManager != null) this.nodeManager.tickCpuOnly();
+        if (this.modelService != null) this.modelService.tick(900_000);
+    }
+
+    public double getVitrailCameraX() { return this.vitrailCameraX; }
+    public double getVitrailCameraZ() { return this.vitrailCameraZ; }
+
+    /** Returns caller-owned copies of Voxy's retained CPU LOD sections for Vitrail conversion. */
+    public List<me.cortex.voxy.client.core.rendering.building.BuiltSection> getVitrailCpuSectionsSnapshot() {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive() || this.nodeManager == null) {
+            return List.of();
+        }
+        return this.nodeManager.getCpuSectionsSnapshot();
+    }
+
+    public List<me.cortex.voxy.client.core.rendering.hierachical.NodeManager.GeometryNode>
+    getVitrailGeometryNodesSnapshot() {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive() || this.nodeManager == null) {
+            return List.of();
+        }
+        return this.nodeManager.getCpuGeometryNodesSnapshot();
+    }
+
+    public List<me.cortex.voxy.client.core.rendering.hierachical.NodeManager.GeometryNode>
+    getVitrailVisibleNodes(double cameraX, double cameraZ) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive() || this.nodeManager == null) {
+            return List.of();
+        }
+        // sectionRenderDistance is scaled in 1/16-chunk steps. Voxy's own render path
+        // converts it to blocks with *16*32; using only *32 here rejects distant CPU LODs.
+        double minimumDistance = getVanillaRenderDistance();
+        double maxDistance = VoxyConfig.CONFIG.sectionRenderDistance * 16.0 * 32.0;
+        return me.cortex.voxy.client.core.rendering.hierachical.VitrailLodSelector.select(
+                this.nodeManager.getCpuGeometryNodesSnapshot(), cameraX, cameraZ,
+                minimumDistance, maxDistance);
+    }
+
+    public me.cortex.voxy.client.core.rendering.building.BuiltSection
+    getVitrailCpuSectionSnapshot(int geometryId) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive() || this.nodeManager == null) {
+            return null;
+        }
+        return this.nodeManager.getCpuSectionSnapshot(geometryId);
+    }
+
+    /** Selects the current CPU LOD cut and returns caller-owned copies of those section meshes. */
+    public List<VitrailVisibleSection> getVitrailVisibleSections(double cameraX, double cameraZ) {
+        List<me.cortex.voxy.client.core.rendering.hierachical.NodeManager.GeometryNode> selected =
+                this.getVitrailVisibleNodes(cameraX, cameraZ);
+        java.util.ArrayList<VitrailVisibleSection> result = new java.util.ArrayList<>(selected.size());
+        try {
+            for (var node : selected) {
+                var section = this.getVitrailCpuSectionSnapshot(node.geometryId());
+                if (section != null) {
+                    if (section.position != node.position()) {
+                        section.free();
+                        continue;
+                    }
+                    result.add(new VitrailVisibleSection(node, section));
+                }
+            }
+            return List.copyOf(result);
+        } catch (RuntimeException | Error e) {
+            result.forEach(VitrailVisibleSection::close);
+            throw e;
+        }
+    }
+
+    /** Reads the CPU mirror of a model face record used to expand Voxy's packed quad. */
+    public int getVitrailModelFaceData(int modelId, int face) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive() || this.modelService == null) {
+            throw new IllegalStateException("Vitrail CPU model data is not available");
+        }
+        return this.modelService.factory.getFaceData(modelId, face);
+    }
+
+    /** DH mini-ID used by shader packs to distinguish distant terrain materials. */
+    public int getVitrailModelMaterial(int modelId) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive() || this.modelService == null) {
+            throw new IllegalStateException("Vitrail CPU model data is not available");
+        }
+        return this.modelService.factory.getVitrailDistantMaterial(modelId);
+    }
+
+    /** Model/biome tint and Voxy's directional face shade in Vitrail's RGBA byte order. */
+    public int getVitrailFaceColour(int modelId, int biomeId, int face, boolean opaque) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive() || this.modelService == null) {
+            return 0xffff_ffff;
+        }
+        int rgba = this.modelService.factory.getVitrailFaceColour(modelId, biomeId, face, opaque);
+        var level = net.minecraft.client.Minecraft.getInstance().level;
+        if (level == null || !this.modelService.factory.isModelShaded(modelId)) return rgba;
+        var light = level.cardinalLighting();
+        float shade = switch (face) {
+            case 0 -> light.down();
+            case 1 -> light.up();
+            case 2, 3 -> light.north();
+            case 4, 5 -> light.east();
+            default -> 1.0f;
+        };
+        int red = Math.round(((rgba >>> 24) & 0xff) * shade);
+        int green = Math.round(((rgba >>> 16) & 0xff) * shade);
+        int blue = Math.round(((rgba >>> 8) & 0xff) * shade);
+        return (red << 24) | (green << 16) | (blue << 8) | (rgba & 0xff);
+    }
+
     public void renderOpaque(Viewport<?> viewport, int sourceDepthTexture, int sourceColourTexture) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return;
         }
         if (viewport == null) {
@@ -459,7 +580,7 @@ public class VoxyRenderSystem {
     }
 
     private boolean frexStillHasWork() {
-        if (FabricLoader.getInstance().isModLoaded("vitrail") || !VoxyClient.isFrexActive()) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive() || !VoxyClient.isFrexActive()) {
             return false;
         }
         UploadStream.INSTANCE.tick();
@@ -475,7 +596,7 @@ public class VoxyRenderSystem {
     }
 
     public Viewport<?> getViewport() {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return null;
         }
         if (IrisUtil.irisShadowActive()) {
@@ -485,8 +606,8 @@ public class VoxyRenderSystem {
     }
 
     public void addDebugInfo(List<String> debug) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
-            debug.add("Voxy [Vitrail/Vulkan]: LOD Engine Active");
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            debug.add("Voxy [Vitrail/Vulkan]: CPU LOD provider active");
             if (this.modelService != null) this.modelService.addDebugData(debug);
             if (this.renderGen != null) this.renderGen.addDebugData(debug);
             if (this.nodeManager != null) this.nodeManager.addDebug(debug);
@@ -510,7 +631,8 @@ public class VoxyRenderSystem {
     }
 
     public void shutdown() {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            VitrailBridge.unregisterProvider();
             try {
                 this.worldIn.setDirtyCallback(null);
                 this.worldIn.getMapper().setBiomeCallback(null);

@@ -33,7 +33,10 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
 
     @Inject(method = "render", at = @At(value = "HEAD"), cancellable = true)
     private void voxy$cancelThingie(ChunkRenderMatrices matrices, ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera, FogParameters parameters, boolean indexedRenderingEnabled, GpuSampler terrainSampler, GpuBufferSlice uniformData, GpuBuffer sectionTimeInfo, CallbackInfo ci) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            // Vitrail uses a separate LOD depth attachment. Draw its opaque colours before
+            // vanilla chunks so far surfaces cannot overwrite already drawn near surfaces.
+            this.doRender(matrices, renderPass, camera, parameters);
             return;
         }
         if (VoxyClient.disableSodiumChunkRender()) {
@@ -46,7 +49,7 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
 
     @Inject(method = "render", at = @At(value = "INVOKE", target = "Lnet/caffeinemc/mods/sodium/client/render/chunk/ShaderChunkRenderer;end(Lnet/caffeinemc/mods/sodium/client/render/chunk/terrain/TerrainRenderPass;)V", shift = At.Shift.BEFORE))
     private void voxy$injectRender(ChunkRenderMatrices matrices, ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera, FogParameters parameters, boolean indexedRenderingEnabled, GpuSampler terrainSampler, GpuBufferSlice uniformData, GpuBuffer sectionTimeInfo, CallbackInfo ci) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return;
         }
         this.doRender(matrices, renderPass, camera, parameters);
@@ -54,7 +57,16 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
 
     @Unique
     private void doRender(ChunkRenderMatrices matrices, TerrainRenderPass renderPass, CameraTransform camera, FogParameters fogParameters) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            if (renderPass == DefaultTerrainRenderPasses.SOLID) {
+                var renderer = IVoxyRenderSystemHolder.getNullable();
+                if (renderer != null) {
+                    renderer.tickVitrail(camera.x, camera.z);
+                }
+                me.cortex.voxy.client.core.VitrailBridge.drawFromSodium(true);
+            } else if (renderPass == DefaultTerrainRenderPasses.TRANSLUCENT) {
+                me.cortex.voxy.client.core.VitrailBridge.drawFromSodium(false);
+            }
             return;
         }
         if (renderPass == DefaultTerrainRenderPasses.CUTOUT) {

@@ -25,7 +25,7 @@ public class GlTexture extends TrackedObject {
     }
 
     public GlTexture(int type) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             this.id = 0;
         } else {
             this.id = glCreateTextures(type);
@@ -35,7 +35,7 @@ public class GlTexture extends TrackedObject {
     }
 
     private GlTexture(int type, boolean useGenTypes) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             this.id = 0;
         } else if (useGenTypes) {
             this.id = glGenTextures();
@@ -54,7 +54,7 @@ public class GlTexture extends TrackedObject {
 
         this.format = format;
         if (this.type == GL_TEXTURE_2D) {
-            if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+            if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
                 glTextureStorage2D(this.id, levels, format, width, height);
             }
             this.width = width;
@@ -70,7 +70,7 @@ public class GlTexture extends TrackedObject {
     public GlTexture createView() {
         this.assertAllocated();
         var view = new GlTexture(this.type, true);
-        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             glTextureView(view.id, this.type, this.id, this.format, 0, 1, 0, 1);
         }
         return view;
@@ -84,14 +84,14 @@ public class GlTexture extends TrackedObject {
         COUNT--;
         this.hasAllocated = false;
         super.free0();
-        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             glDeleteTextures(this.id);
         }
     }
 
     public GlTexture name(String name) {
         this.assertAllocated();
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return this;
         }
         return GlDebug.name(name, this);
@@ -156,7 +156,7 @@ public class GlTexture extends TrackedObject {
 
     public GlTexture zero() {
         this.assertAllocated();
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return this;
         }
         int type = switch (this.format) {

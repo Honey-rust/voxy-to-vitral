@@ -31,20 +31,20 @@ public class Shader extends TrackedObject {
     }
 
     public void bind() {
-        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             glUseProgram(this.id);
         }
     }
 
     public void free() {
         super.free0();
-        if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             glDeleteProgram(this.id);
         }
     }
 
     public Shader name(String name) {
-        if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             return this;
         }
         return GlDebug.name(name, this);
@@ -151,7 +151,7 @@ public class Shader extends TrackedObject {
 
 
         private int compileToProgram() {
-            if (FabricLoader.getInstance().isModLoaded("vitrail")) {
+            if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
                 return 0;
             }
             int program = GL20C.glCreateProgram();

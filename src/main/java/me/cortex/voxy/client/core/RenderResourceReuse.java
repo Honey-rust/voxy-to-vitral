@@ -53,7 +53,7 @@ public class RenderResourceReuse {
         long capacity = getGeometryBufferSize();
 
         // === Vitrail (Vulkan) 模式：直接返回虚拟 GlBuffer，不走 OpenGL glGetError 与稀疏缓冲 ===
-        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             Logger.info("Allocating Vitrail (Vulkan) geometry buffer: " + capacity);
             return new GlBuffer(capacity, 0, false);
         }

@@ -56,8 +56,8 @@ public class Capabilities {
 
     public Capabilities() {
         // === 1. Vitrail (Vulkan) 环境：赋予支持参数，唤醒 Voxy 设置与逻辑 ===
-        if (net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("vitrail")) {
-            org.slf4j.LoggerFactory.getLogger("Voxy").info("[Voxy] Vitrail (Vulkan) detected! Enabling Voxy interface and pipeline.");
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            org.slf4j.LoggerFactory.getLogger("Voxy").info("[Voxy] Vitrail Vulkan backend detected; OpenGL capability probing is skipped.");
             this.sparseBuffer = true;
             this.compute = true;
             this.indirectParameters = true;

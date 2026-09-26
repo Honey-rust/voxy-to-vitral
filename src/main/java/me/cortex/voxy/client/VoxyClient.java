@@ -52,10 +52,10 @@ public class VoxyClient implements ClientModInitializer {
         if (systemSupported) {
 
             // Vitrail (Vulkan) 模式下跳过 OpenGL 缓冲区预分配，防止底层段错误崩溃
-            if (!FabricLoader.getInstance().isModLoaded("vitrail")) {
+            if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
                 SharedIndexBuffer.INSTANCE.id();
             } else {
-                Logger.info("Vitrail (Vulkan) detected: skipping OpenGL SharedIndexBuffer pre-allocation.");
+                Logger.info("Vitrail Vulkan backend detected: skipping OpenGL SharedIndexBuffer pre-allocation.");
             }
 
             VoxyCommon.setInstanceFactory(VoxyClientInstance::new);
