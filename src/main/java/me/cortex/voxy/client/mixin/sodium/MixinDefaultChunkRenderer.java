@@ -34,8 +34,9 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
     @Inject(method = "render", at = @At(value = "HEAD"), cancellable = true)
     private void voxy$cancelThingie(ChunkRenderMatrices matrices, ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera, FogParameters parameters, boolean indexedRenderingEnabled, GpuSampler terrainSampler, GpuBufferSlice uniformData, GpuBuffer sectionTimeInfo, CallbackInfo ci) {
         if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
-            // Vitrail uses a separate LOD depth attachment. Draw its opaque colours before
-            // vanilla chunks so far surfaces cannot overwrite already drawn near surfaces.
+            // Match Voxy's composition order: distant terrain establishes the far background,
+            // then Sodium's real chunks overwrite it. In particular, never let the coarse LOD
+            // cover or modify the depth of nearby vanilla terrain.
             this.doRender(matrices, renderPass, camera, parameters);
             return;
         }
@@ -61,11 +62,17 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
             if (renderPass == DefaultTerrainRenderPasses.SOLID) {
                 var renderer = IVoxyRenderSystemHolder.getNullable();
                 if (renderer != null) {
-                    renderer.tickVitrail(camera.x, camera.z);
+                    var target = renderPass.getTarget();
+                    renderer.tickVitrail(matrices.projection(), matrices.modelView(),
+                            target.width, target.height, camera.x, camera.y, camera.z);
                 }
-                me.cortex.voxy.client.core.VitrailBridge.drawFromSodium(true);
+                if (!me.cortex.voxy.client.core.VitrailBridge.usesPlainRenderer()) {
+                    me.cortex.voxy.client.core.VitrailBridge.drawFromSodium(true);
+                }
             } else if (renderPass == DefaultTerrainRenderPasses.TRANSLUCENT) {
-                me.cortex.voxy.client.core.VitrailBridge.drawFromSodium(false);
+                if (!me.cortex.voxy.client.core.VitrailBridge.usesPlainRenderer()) {
+                    me.cortex.voxy.client.core.VitrailBridge.drawFromSodium(false);
+                }
             }
             return;
         }
@@ -82,6 +89,22 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
                 }
                 renderer.renderOpaque(viewport, ((GlTextureView)target.getDepthTextureView()).glId(), ((GlTextureView)target.getColorTextureView()).glId());
             }
+        }
+    }
+
+    // Sodium has an early return when this terrain pass has no commands. At high altitude
+    // the near cutout list can be empty even though Voxy still has distant terrain to draw.
+    // TAIL only visits the final return; RETURN must cover both exits independently.
+    @Inject(method = "render", at = @At("RETURN"), require = 2)
+    private void voxy$drawPlainLodAfterCutout(ChunkRenderMatrices matrices,
+            ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera,
+            FogParameters parameters, boolean indexedRenderingEnabled, GpuSampler terrainSampler,
+            GpuBufferSlice uniformData, GpuBuffer sectionTimeInfo, CallbackInfo ci) {
+        if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()
+                && renderPass == DefaultTerrainRenderPasses.CUTOUT
+                && me.cortex.voxy.client.core.VitrailBridge.usesPlainRenderer()) {
+            me.cortex.voxy.client.core.VitrailBridge.drawPlainFromSodium(
+                    matrices.projection(), matrices.modelView(), camera.x, camera.y, camera.z);
         }
     }
 }

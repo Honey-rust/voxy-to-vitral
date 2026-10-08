@@ -15,6 +15,8 @@ import java.util.function.IntUnaryOperator;
 /** Expands a visible Voxy packed section into Vitrail's indexed 16-byte CPU mesh layout. */
 public final class VitrailCpuMeshEncoder {
     public static final int VERTEX_STRIDE = 16;
+    /** 2048 models x 6 faces fit in a 256x12288 atlas, normally leaving only two pages. */
+    public static final int MODELS_PER_ATLAS_PAGE = 2048;
 
     private VitrailCpuMeshEncoder() {}
 
@@ -52,15 +54,18 @@ public final class VitrailCpuMeshEncoder {
 
     public static List<Mesh> encode(BuiltSection section, IntBinaryOperator faceDataLookup,
             TintLookup tintLookup, IntUnaryOperator materialLookup, Boolean opaqueOnly) {
-        return encode(section, faceDataLookup, tintLookup, materialLookup, (m, f) -> -1, opaqueOnly);
+        return encode(section, faceDataLookup, tintLookup, materialLookup, ignored -> 0,
+                (m, f) -> -1, opaqueOnly);
     }
 
     public static List<Mesh> encode(BuiltSection section, IntBinaryOperator faceDataLookup,
-            TintLookup tintLookup, IntUnaryOperator materialLookup, IntBinaryOperator averageLookup, Boolean opaqueOnly) {
+            TintLookup tintLookup, IntUnaryOperator materialLookup, IntUnaryOperator nearSuppressionLookup,
+            IntBinaryOperator averageLookup, Boolean opaqueOnly) {
         if (section == null || section.isEmpty() || section.geometryBuffer == null) return List.of();
         if (faceDataLookup == null) throw new NullPointerException("faceDataLookup");
         if (tintLookup == null) throw new NullPointerException("tintLookup");
         if (materialLookup == null) throw new NullPointerException("materialLookup");
+        if (nearSuppressionLookup == null) throw new NullPointerException("nearSuppressionLookup");
         if (section.offsets == null || section.offsets.length < 8) {
             throw new IllegalArgumentException("BuiltSection does not contain Voxy quad-group offsets");
         }
@@ -85,6 +90,7 @@ public final class VitrailCpuMeshEncoder {
                     int modelId = (int) ((packed >>> 26) & 0xffffL);
                     int biomeId = (int) ((packed >>> 46) & 0x1ffL);
                     int faceData = faceDataLookup.applyAsInt(modelId, face);
+                    int nearSuppression = nearSuppressionLookup.applyAsInt(modelId) != 0 ? 0x8000 : 0;
                     VitrailQuadEncoder.encode(packed, section.position,
                             WorldEngine.getLevel(section.position), faceData,
                             tintLookup.colour(modelId, biomeId, face, opaque),
@@ -92,10 +98,13 @@ public final class VitrailCpuMeshEncoder {
                                     ? VitrailQuadEncoder.OPAQUE_TILE_BLOCKS
                                     : VitrailQuadEncoder.TRANSLUCENT_TILE_BLOCKS,
                             (sx, sy, sz, v0, v1, v2, v3, reverse) -> {
-                                TileKey key = new TileKey(sx, sy, sz, opaque, modelId / 256);
+                                TileKey key = new TileKey(sx, sy, sz, opaque,
+                                        modelId / MODELS_PER_ATLAS_PAGE);
                                 MeshBuilder builder = builders.computeIfAbsent(key, ignored -> new MeshBuilder());
-                                builder.append(v0, v1, v2, v3, reverse, (modelId % 256) * 6 + face,
-                                        WorldEngine.getLevel(section.position), averageLookup.applyAsInt(modelId, face));
+                                builder.append(v0, v1, v2, v3, reverse,
+                                        (modelId % MODELS_PER_ATLAS_PAGE) * 6 + face,
+                                        WorldEngine.getLevel(section.position), averageLookup.applyAsInt(modelId, face),
+                                        nearSuppression);
                             });
                 }
             }
@@ -166,6 +175,89 @@ public final class VitrailCpuMeshEncoder {
         }
     }
 
+    /**
+     * Combines meshes from nearby tiles by rebasing their unsigned-short positions onto one
+     * shared origin. Voxy normally submits these through one indirect draw stream; Vitrail's
+     * provider API uses ordinary indexed draws, so doing the equivalent aggregation on the CPU
+     * avoids one render pass draw for every source tile.
+     */
+    public static Mesh combineRebased(List<Mesh> sources) {
+        if (sources.isEmpty()) throw new IllegalArgumentException("No meshes to combine");
+        Mesh first = sources.getFirst();
+        int originX = first.x();
+        int originY = first.y();
+        int originZ = first.z();
+        long vertexBytes = 0;
+        long detailBytes = 0;
+        long indexBytes = 0;
+        int vertexCount = 0;
+        int indexCount = 0;
+        for (Mesh source : sources) {
+            if (source.opaque() != first.opaque() || source.atlasPage() != first.atlasPage()) {
+                throw new IllegalArgumentException("Cannot combine different passes or atlas pages");
+            }
+            originX = Math.min(originX, source.x());
+            originY = Math.min(originY, source.y());
+            originZ = Math.min(originZ, source.z());
+            vertexBytes = Math.addExact(vertexBytes, source.vertices().size);
+            detailBytes = Math.addExact(detailBytes, source.detail().size);
+            indexBytes = Math.addExact(indexBytes, source.indices().size);
+            vertexCount = Math.addExact(vertexCount, source.vertexCount());
+            indexCount = Math.addExact(indexCount, source.indexCount());
+        }
+
+        MemoryBuffer vertices = new MemoryBuffer(vertexBytes);
+        MemoryBuffer details = new MemoryBuffer(detailBytes);
+        MemoryBuffer indices = new MemoryBuffer(indexBytes);
+        long vertexOffset = 0;
+        long detailOffset = 0;
+        int writtenIndices = 0;
+        int baseVertex = 0;
+        try {
+            for (Mesh source : sources) {
+                UnsafeUtil.memcpy(source.vertices().address, vertices.address + vertexOffset,
+                        source.vertices().size);
+                int dx = Math.subtractExact(source.x(), originX);
+                int dy = Math.subtractExact(source.y(), originY);
+                int dz = Math.subtractExact(source.z(), originZ);
+                for (int i = 0; i < source.vertexCount(); i++) {
+                    long sourcePtr = source.vertices().address + (long)i * VERTEX_STRIDE;
+                    long targetPtr = vertices.address + vertexOffset + (long)i * VERTEX_STRIDE;
+                    putUnsignedShort(targetPtr,
+                            Math.addExact(Short.toUnsignedInt(MemoryUtil.memGetShort(sourcePtr)), dx));
+                    putUnsignedShort(targetPtr + 2,
+                            Math.addExact(Short.toUnsignedInt(MemoryUtil.memGetShort(sourcePtr + 2)), dy));
+                    putUnsignedShort(targetPtr + 4,
+                            Math.addExact(Short.toUnsignedInt(MemoryUtil.memGetShort(sourcePtr + 4)), dz));
+                }
+                UnsafeUtil.memcpy(source.detail().address, details.address + detailOffset,
+                        source.detail().size);
+                for (int i = 0; i < source.indexCount(); i++) {
+                    int index = MemoryUtil.memGetInt(source.indices().address + (long)i * Integer.BYTES);
+                    MemoryUtil.memPutInt(indices.address + (long)writtenIndices++ * Integer.BYTES,
+                            Math.addExact(index, baseVertex));
+                }
+                vertexOffset += source.vertices().size;
+                detailOffset += source.detail().size;
+                baseVertex = Math.addExact(baseVertex, source.vertexCount());
+            }
+            return new Mesh(originX, originY, originZ, first.opaque(), vertices, indices,
+                    vertexCount, indexCount, details, first.atlasPage());
+        } catch (RuntimeException | Error e) {
+            vertices.free();
+            indices.free();
+            details.free();
+            throw e;
+        }
+    }
+
+    private static void putUnsignedShort(long address, int value) {
+        if ((value & ~0xffff) != 0) {
+            throw new IllegalArgumentException("Rebased Vitrail vertex exceeds 16-bit position range: " + value);
+        }
+        MemoryUtil.memPutShort(address, (short)value);
+    }
+
     private static final class MeshBuilder {
         private MemoryBuffer vertices = new MemoryBuffer(1024);
         private MemoryBuffer indices = new MemoryBuffer(1536);
@@ -175,12 +267,12 @@ public final class VitrailCpuMeshEncoder {
 
         void append(VitrailQuadEncoder.Vertex v0, VitrailQuadEncoder.Vertex v1,
                 VitrailQuadEncoder.Vertex v2, VitrailQuadEncoder.Vertex v3, boolean reverse,
-                int tile, int lod, int average) {
+                int tile, int lod, int average, int nearSuppression) {
             ensureVertexCapacity(vertexCount + 4);
             ensureIndexCapacity(indexCount + 6);
             long ptr = vertices.address + (long) vertexCount * VERTEX_STRIDE;
-            writeVertex(ptr, v0); writeVertex(ptr + VERTEX_STRIDE, v1);
-            writeVertex(ptr + VERTEX_STRIDE * 2L, v2); writeVertex(ptr + VERTEX_STRIDE * 3L, v3);
+            writeVertex(ptr, v0, nearSuppression); writeVertex(ptr + VERTEX_STRIDE, v1, nearSuppression);
+            writeVertex(ptr + VERTEX_STRIDE * 2L, v2, nearSuppression); writeVertex(ptr + VERTEX_STRIDE * 3L, v3, nearSuppression);
             VitrailQuadEncoder.Vertex[] corners = {v0, v1, v2, v3};
             for (int i = 0; i < 4; i++) {
                 var v = corners[i];
@@ -266,11 +358,12 @@ public final class VitrailCpuMeshEncoder {
         }
     }
 
-    private static void writeVertex(long ptr, VitrailQuadEncoder.Vertex vertex) {
+    private static void writeVertex(long ptr, VitrailQuadEncoder.Vertex vertex, int nearSuppression) {
         MemoryUtil.memPutShort(ptr, (short) vertex.x());
         MemoryUtil.memPutShort(ptr + 2, (short) vertex.y());
         MemoryUtil.memPutShort(ptr + 4, (short) vertex.z());
-        MemoryUtil.memPutShort(ptr + 6, (short) (vertex.light() & 0xff));
+        // Vitrail's DH-compatible nudge decoder uses bits 8-13; bit 15 is free.
+        MemoryUtil.memPutShort(ptr + 6, (short) ((vertex.light() & 0xff) | nearSuppression));
         int rgba = vertex.colour();
         MemoryUtil.memPutByte(ptr + 8, (byte) (rgba >>> 24));
         MemoryUtil.memPutByte(ptr + 9, (byte) (rgba >>> 16));

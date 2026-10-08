@@ -9,6 +9,7 @@ import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.gl.shader.Shader;
 import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.rendering.GeometryCache;
+import me.cortex.voxy.client.core.rendering.compat.HierarchyView;
 import me.cortex.voxy.client.core.rendering.SectionUpdateRouter;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.building.RenderGenerationService;
@@ -68,6 +69,7 @@ public class AsyncNodeManager {
     private volatile boolean running = true;
     private volatile Throwable uncaughtException;
     private volatile List<NodeManager.GeometryNode> cpuGeometryNodes = List.of();
+    private volatile HierarchyView cpuHierarchyView = HierarchyView.EMPTY;
 
     private final NodeManager manager;
     private final BasicAsyncGeometryManager geometryManager;
@@ -501,6 +503,7 @@ public class AsyncNodeManager {
         results.currentMaxNodeId = this.manager.getCurrentMaxNodeId();
         if (me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
             this.cpuGeometryNodes = this.manager.snapshotGeometryNodes();
+            this.cpuHierarchyView = this.manager.snapshotHierarchyView();
         }
 
         this.needsWaitForSync |= results.geometryUpload.currentElemCopyAmount*8L > 2L<<20;//2mb limit per frame
@@ -670,6 +673,10 @@ public class AsyncNodeManager {
 
     public List<NodeManager.GeometryNode> getCpuGeometryNodesSnapshot() {
         return this.cpuGeometryNodes;
+    }
+
+    public HierarchyView getCpuHierarchyViewSnapshot() {
+        return this.cpuHierarchyView;
     }
 
 

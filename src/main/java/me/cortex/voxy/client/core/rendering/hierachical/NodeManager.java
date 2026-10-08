@@ -8,6 +8,7 @@ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import me.cortex.voxy.client.core.gl.GlBuffer;
 import me.cortex.voxy.client.core.rendering.ISectionWatcher;
+import me.cortex.voxy.client.core.rendering.compat.HierarchyView;
 import me.cortex.voxy.client.core.rendering.building.BuiltSection;
 import me.cortex.voxy.client.core.rendering.section.geometry.BasicAsyncGeometryManager;
 import me.cortex.voxy.client.core.rendering.section.geometry.IGeometryManager;
@@ -20,6 +21,8 @@ import org.lwjgl.system.MemoryUtil;
 
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static me.cortex.voxy.common.world.WorldEngine.MAX_LOD_LAYER;
 import static me.cortex.voxy.common.world.WorldEngine.UPDATE_TYPE_BLOCK_BIT;
@@ -32,6 +35,7 @@ import static me.cortex.voxy.common.world.WorldEngine.UPDATE_TYPE_BLOCK_BIT;
 
 
 public class NodeManager {
+    private static final AtomicLong NEXT_HIERARCHY_EPOCH = new AtomicLong(1);
     private static final boolean VERIFY_NODE_MANAGER_OPERATIONS = true;//VoxyCommon.isVerificationFlagOn("nodeManager");
     //Assumptions:
     // all nodes have children (i.e. all nodes have at least one child existence bit set at all times)
@@ -91,6 +95,8 @@ public class NodeManager {
     private final IntOpenHashSet topLevelNodeIds = new IntOpenHashSet();
     private final LongOpenHashSet topLevelNodes = new LongOpenHashSet();
     private int activeNodeRequestCount;
+    private final long hierarchyEpoch = NEXT_HIERARCHY_EPOCH.getAndIncrement();
+    private long hierarchyGeneration;
 
     /** Geometry-bearing nodes copied on the manager thread for CPU renderer traversal. */
     public record GeometryNode(long position, int geometryId, long geometryVersion, int level,
@@ -112,6 +118,41 @@ public class NodeManager {
                     type == NODE_TYPE_INNER, this.nodeData.isNodeRequestInFlight(nodeId)));
         }
         return List.copyOf(snapshot);
+    }
+
+    /** Publishes Voxy's real node graph without exposing GL buffers or compatibility renderer types. */
+    public HierarchyView snapshotHierarchyView() {
+        int endNodeId = Math.max(0, this.nodeData.getEndNodeId());
+        HierarchyView.Node[] nodes = new HierarchyView.Node[endNodeId + 1];
+        int nodeCount = 0;
+        for (int nodeId = 0; nodeId <= endNodeId; nodeId++) {
+            if (!this.nodeData.nodeExists(nodeId)) continue;
+            long position = this.nodeData.nodePosition(nodeId);
+            int geometryId = this.nodeData.getNodeGeometry(nodeId);
+            long geometryVersion = geometryId >= 0 && this.geometryManager instanceof BasicAsyncGeometryManager cpuManager
+                    ? cpuManager.getCpuSectionVersion(geometryId) : 0;
+            int type = this.nodeData.getNodeType(nodeId);
+            int childPointer = this.nodeData.getChildPtr(nodeId);
+            int childCount = childPointer < 0 ? 0 : this.nodeData.getChildPtrCount(nodeId);
+            if (childPointer == SENTINEL_EMPTY_CHILD_PTR) {
+                childPointer = HierarchyView.EMPTY_CHILD_POINTER;
+                childCount = 0;
+            }
+            int flags = 0;
+            if (type == NODE_TYPE_INNER) flags |= HierarchyView.FLAG_INNER;
+            if (this.nodeData.isNodeRequestInFlight(nodeId)) flags |= HierarchyView.FLAG_REQUEST_IN_FLIGHT;
+            if (this.nodeData.isNodeGeometryInFlight(nodeId)) flags |= HierarchyView.FLAG_GEOMETRY_IN_FLIGHT;
+            if (this.nodeData.getAllChildrenAreLeaf(nodeId)) flags |= HierarchyView.FLAG_ALL_CHILDREN_LEAF;
+            nodes[nodeId] = new HierarchyView.Node(
+                    nodeId, position, WorldEngine.getLevel(position), childPointer, childCount,
+                    this.nodeData.getNodeChildExistence(nodeId), flags, geometryId, geometryVersion,
+                    this.nodeData.getNodeRequest(nodeId));
+            nodeCount++;
+        }
+        int[] topLevelIds = this.topLevelNodeIds.toIntArray();
+        Arrays.sort(topLevelIds);
+        return new HierarchyView(this.hierarchyEpoch, ++this.hierarchyGeneration,
+                topLevelIds, nodes, nodeCount);
     }
 
     private IntConsumer topLevelNodeIdAddedCallback;
