@@ -159,7 +159,7 @@ public class SodiumConfigBuilder {
             var page = builder.createOptionPage();
             page.setName(this.name);
             for (var group : this.groups) {
-                page.addOptionGroup(group.create(builder, ctx));
+                if (group.options.length != 0) page.addOptionGroup(group.create(builder, ctx));
             }
             return page;
         }

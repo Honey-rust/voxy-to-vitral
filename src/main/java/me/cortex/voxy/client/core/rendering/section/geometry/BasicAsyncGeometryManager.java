@@ -181,6 +181,13 @@ public class BasicAsyncGeometryManager implements IGeometryManager {
         return section == null ? null : section.clone();
     }
 
+    /** Version and bytes must be captured atomically before a background conversion. */
+    public synchronized BuiltSection getCpuSectionSnapshot(int geometryId, long expectedVersion) {
+        if (this.cpuSectionVersions.get(geometryId) != expectedVersion) return null;
+        BuiltSection section = this.cpuSections.get(geometryId);
+        return section == null ? null : section.clone();
+    }
+
     public synchronized long getCpuSectionVersion(int geometryId) {
         return this.cpuSectionVersions.get(geometryId);
     }

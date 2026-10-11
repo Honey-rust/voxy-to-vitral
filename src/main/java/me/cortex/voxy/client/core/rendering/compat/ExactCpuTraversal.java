@@ -5,10 +5,10 @@ import org.joml.Matrix4fc;
 
 import java.util.ArrayList;
 import java.util.BitSet;
-import java.util.HashMap;
-import java.util.HashSet;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.util.List;
-import java.util.Map;
 
 /**
  * CPU shadow implementation of Voxy's hierarchy traversal.
@@ -20,12 +20,6 @@ public final class ExactCpuTraversal {
     private static final double EXIT_HYSTERESIS = 0.85;
     private static final double CLIP_EPSILON = 1.0e-5;
     /**
-     * Keep a complete coarse cut around the camera while only refining the current view at the
-     * normal screen-space threshold.  Vitrail replaces its provider aggregate atomically, so
-     * frustum-culling this base cut would otherwise make terrain disappear as the camera turns.
-     */
-    private static final double OFFSCREEN_SUBDIVISION_MULTIPLIER = 8.0;
-    /**
      * Native Voxy only retains the current frustum and lets Hi-Z remove more of that cut.  The
      * bridge deliberately keeps an omnidirectional fallback because its provider aggregate is
      * replaced asynchronously.  Compensate for that larger working set by spending progressively
@@ -34,36 +28,59 @@ public final class ExactCpuTraversal {
     private static final double FAR_DETAIL_START_FRACTION = 0.20;
     private static final double FAR_DETAIL_MAX_MULTIPLIER = 4.0;
 
-    private static final int RETAINED_DETAIL_FRAMES = 360;
-    private final Map<Integer, Integer> lastViewedRefinementFrame = new HashMap<>();
+    private static final long RETAINED_DETAIL_NANOS = 8_000_000_000L;
+    private final Long2LongOpenHashMap lastViewedRefinementTime = new Long2LongOpenHashMap();
+    private final Long2ObjectOpenHashMap<ZoomDetail> zoomDetails = new Long2ObjectOpenHashMap<>();
+    private record ZoomDetail(double factor, long untilNanos) {}
+    // Traversals are sequential on the render thread; reuse the audit scratch table.
+    private final LongOpenHashSet selectedPositions = new LongOpenHashSet();
     private int frame;
     private long historyEpoch = Long.MIN_VALUE;
+    private long zoomExitSince;
 
     public Result traverse(HierarchyView hierarchy, Parameters parameters) {
+        return traverse(hierarchy, parameters, null);
+    }
+
+    /** A presentation cut may advance only one layer below the cut actually on screen. */
+    public Result traverse(HierarchyView hierarchy, Parameters parameters, java.util.Set<Long> refinementFrontier) {
         long start = System.nanoTime();
         if (hierarchy.epoch() != this.historyEpoch) {
-            this.lastViewedRefinementFrame.clear();
+            this.lastViewedRefinementTime.clear();
+            this.zoomDetails.clear();
             this.frame = 0;
+            this.zoomExitSince = 0;
             this.historyEpoch = hierarchy.epoch();
         }
         this.frame++;
 
-        State state = new State(hierarchy, parameters, this.lastViewedRefinementFrame, this.frame);
+        State state = new State(hierarchy, parameters, this.lastViewedRefinementTime, this.zoomDetails, start, refinementFrontier);
+        if (state.zoomFactor <= 1.20) {
+            if (this.zoomExitSince == 0) this.zoomExitSince = start;
+        } else {
+            this.zoomExitSince = 0;
+        }
+        if (this.zoomExitSince != 0 && start - this.zoomExitSince >= 250_000_000L) {
+            // Retain encoded meshes in the cache, but stop selecting extra zoom-only detail.
+            for (long position : this.zoomDetails.keySet()) this.lastViewedRefinementTime.remove(position);
+            this.zoomDetails.clear();
+        }
         for (int rootId : hierarchy.topLevelNodeIds()) {
             state.visit(rootId);
         }
-        // Keep recently viewed detail long enough for the asynchronous provider build and a quick
-        // look back, then let it return to the cheaper omnidirectional cut. Permanently retaining
-        // every direction visited grows the cut and rebuild cost for the lifetime of the world.
-        for (int nodeId = state.viewedRefinements.nextSetBit(0); nodeId >= 0;
-                nodeId = state.viewedRefinements.nextSetBit(nodeId + 1)) {
-            this.lastViewedRefinementFrame.put(nodeId, this.frame);
-        }
+        // Distance-selected refinements are refreshed every traversal, regardless of yaw,
+        // pitch or visibility. Only unvisited entries expire (unloaded/out-of-range nodes).
         if ((this.frame & 31) == 0) {
-            this.lastViewedRefinementFrame.entrySet().removeIf(
-                    entry -> this.frame - entry.getValue() > RETAINED_DETAIL_FRAMES);
+            var retained = this.lastViewedRefinementTime.long2LongEntrySet().fastIterator();
+            while (retained.hasNext()) {
+                if (start - retained.next().getLongValue() > RETAINED_DETAIL_NANOS) retained.remove();
+            }
+            var zoom = this.zoomDetails.long2ObjectEntrySet().fastIterator();
+            while (zoom.hasNext()) {
+                if (start > zoom.next().getValue().untilNanos()) zoom.remove();
+            }
         }
-        state.parentChildOverlap += state.countSelectedParentChildOverlaps();
+        state.parentChildOverlap += state.countSelectedParentChildOverlaps(this.selectedPositions);
 
         long elapsed = System.nanoTime() - start;
         Stats stats = new Stats(
@@ -123,9 +140,12 @@ public final class ExactCpuTraversal {
     private static final class State {
         private final HierarchyView hierarchy;
         private final Parameters parameters;
-        private final Map<Integer, Integer> lastViewedRefinementFrame;
-        private final int frame;
-        private final BitSet viewedRefinements = new BitSet();
+        private final Long2LongOpenHashMap lastViewedRefinementTime;
+        private final Long2ObjectOpenHashMap<ZoomDetail> zoomDetails;
+        private final java.util.Set<Long> refinementFrontier;
+        private final double zoomFactor;
+        private final double coveragePixels;
+        private final long nowNanos;
         private final BitSet visited = new BitSet();
         private final BitSet requested = new BitSet();
         private final ArrayList<Integer> selectedNodeIds = new ArrayList<>();
@@ -146,11 +166,16 @@ public final class ExactCpuTraversal {
         private int distanceCulled;
 
         private State(HierarchyView hierarchy, Parameters parameters,
-                Map<Integer, Integer> lastViewedRefinementFrame, int frame) {
+                Long2LongOpenHashMap lastViewedRefinementTime, Long2ObjectOpenHashMap<ZoomDetail> zoomDetails, long nowNanos, java.util.Set<Long> refinementFrontier) {
             this.hierarchy = hierarchy;
+            this.refinementFrontier = refinementFrontier;
             this.parameters = parameters;
-            this.lastViewedRefinementFrame = lastViewedRefinementFrame;
-            this.frame = frame;
+            this.lastViewedRefinementTime = lastViewedRefinementTime;
+            this.zoomDetails = zoomDetails;
+            this.coveragePixels = focalScale(parameters.coverageViewProjection) * parameters.viewportHeight * 0.5;
+            this.zoomFactor = Math.max(1.0, focalScale(parameters.viewProjection)
+                    / Math.max(1.0e-6, focalScale(parameters.coverageViewProjection)));
+            this.nowNanos = nowNanos;
         }
 
         /** Returns true if the visible part of this branch has complete geometry coverage. */
@@ -173,33 +198,40 @@ public final class ExactCpuTraversal {
                 return true;
             }
 
-            Projection detailProjection = project(node, this.parameters.viewProjection);
-            Projection coverageProjection = this.parameters.coverageViewProjection == this.parameters.viewProjection
-                    ? detailProjection : project(node, this.parameters.coverageViewProjection);
-            boolean insideView = !coverageProjection.outsideFrustum;
-            // A narrow FOV may request finer nodes in its centre. Outside the widest current view,
-            // use a direction-independent projected size so the aggregate still contains a coarse
-            // hierarchy cut in every direction. Turning can refine that cut but cannot erase it.
-            Projection projection = !detailProjection.outsideFrustum
-                    ? detailProjection
-                    : !coverageProjection.outsideFrustum
-                    ? coverageProjection
-                    : projectOmnidirectional(node);
-
-            Integer lastViewedFrame = this.lastViewedRefinementFrame.get(nodeId);
-            boolean retainedDetail = lastViewedFrame != null
-                    && this.frame - lastViewedFrame <= RETAINED_DETAIL_FRAMES;
-            double threshold = this.parameters.subdivisionPixels
-                    * (insideView || retainedDetail ? 1.0 : OFFSCREEN_SUBDIVISION_MULTIPLIER)
-                    * distanceDetailMultiplier(node);
+            // A persistent all-direction cut must use the same spatial metric in every
+            // direction. Projected face areas change with yaw and pitch, causing asynchronous
+            // fine/coarse replacements even when the camera has not moved.
+            Projection projection = projectOmnidirectional(node);
+            boolean retainedDetail = this.lastViewedRefinementTime.containsKey(node.packedPosition());
+            double threshold = this.parameters.subdivisionPixels * distanceDetailMultiplier(node);
             if (retainedDetail) threshold *= EXIT_HYSTERESIS;
-            boolean refine = node.level() != 0
-                    && projection.pixelArea > threshold * threshold;
+            // Sprint/speed FOV settling is not Zoomify. Do not renew a strong historical zoom
+            // merely because the current normal FOV differs slightly from the widest one.
+            boolean zoomVisible = this.zoomFactor > 1.25
+                    && !project(node, this.parameters.viewProjection).outsideFrustum;
+            ZoomDetail zoom = this.zoomDetails.get(node.packedPosition());
+            double detailFactor = zoom != null && this.nowNanos <= zoom.untilNanos() ? zoom.factor() : 1.0;
+            if (zoomVisible) detailFactor = Math.max(detailFactor, this.zoomFactor);
+            threshold /= detailFactor;
+            boolean refine = node.level() != 0 && projection.pixelArea > threshold * threshold;
             if (refine) {
-                if (insideView) this.viewedRefinements.set(nodeId);
+                this.lastViewedRefinementTime.put(node.packedPosition(), this.nowNanos);
+                if (zoomVisible) this.zoomDetails.put(node.packedPosition(),
+                        new ZoomDetail(this.zoomFactor, this.nowNanos + RETAINED_DETAIL_NANOS));
+            } else {
+                this.lastViewedRefinementTime.remove(node.packedPosition());
             }
 
             if (refine) {
+                // Request traversal remains unrestricted. Only presentation waits for the
+                // previous layer to be published, preventing a ready hierarchy skipping levels.
+                // Missing/empty parents cannot cover their children and must still descend.
+                if (this.refinementFrontier != null && node.hasDrawableGeometry()
+                        && !reachesCamera(node)
+                        && !this.refinementFrontier.contains(node.packedPosition())) {
+                    select(node);
+                    return true;
+                }
                 boolean descended = hasUsableChildren(node);
                 if (descended) {
                     int checkpoint = this.selectedNodeIds.size();
@@ -275,8 +307,8 @@ public final class ExactCpuTraversal {
             }
         }
 
-        private int countSelectedParentChildOverlaps() {
-            HashSet<Long> selectedPositions = new HashSet<>(this.selectedNodeIds.size() * 2);
+        private int countSelectedParentChildOverlaps(LongOpenHashSet selectedPositions) {
+            selectedPositions.clear();
             for (int nodeId : this.selectedNodeIds) {
                 HierarchyView.Node node = this.hierarchy.node(nodeId);
                 if (node != null) selectedPositions.add(node.packedPosition());
@@ -298,6 +330,19 @@ public final class ExactCpuTraversal {
                 }
             }
             return overlaps;
+        }
+
+        private boolean reachesCamera(HierarchyView.Node node) {
+            double size = 32.0 * (1L << node.level());
+            double x = WorldEngine.getX(node.packedPosition()) * size;
+            double y = WorldEngine.getY(node.packedPosition()) * size;
+            double z = WorldEngine.getZ(node.packedPosition()) * size;
+            double dx = distanceToInterval(this.parameters.cameraX, x, x + size);
+            double dy = distanceToInterval(this.parameters.cameraY, y, y + size);
+            double dz = distanceToInterval(this.parameters.cameraZ, z, z + size);
+            // Match the bridge's loading guard: these coarse parents are not drawn,
+            // so waiting for publication would prevent their children ever appearing.
+            return dx * dx + dy * dy + dz * dz < 32.0 * 32.0;
         }
 
         private boolean withinRenderDistance(HierarchyView.Node node) {
@@ -352,9 +397,10 @@ public final class ExactCpuTraversal {
                 w[i] = m.m03() * px + m.m13() * py + m.m23() * pz + m.m33();
             }
 
+            // This projection is only used for zoom refinement eligibility. Vanilla's finite
+            // far plane must not reject the distant terrain that zoom is intended to inspect.
             if (allOutside(x, w, -1) || allOutside(x, w, 1)
-                    || allOutside(y, w, -1) || allOutside(y, w, 1)
-                    || allOutsideNear(z) || allOutside(z, w, 1)) {
+                    || allOutside(y, w, -1) || allOutside(y, w, 1)) {
                 return Projection.CULLED;
             }
 
@@ -393,11 +439,10 @@ public final class ExactCpuTraversal {
             double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
             if (distance <= CLIP_EPSILON) return Projection.FULL_SCREEN;
 
-            // m11 is cot(fovY/2). Use the widest tracked projection so zoom cannot inflate the
-            // off-screen coverage budget. Squaring the apparent side gives a stable area metric
-            // compatible with the normal projected-AABB subdivision test.
-            double pixelsPerBlock = Math.abs(this.parameters.coverageViewProjection.m11())
-                    * this.parameters.viewportHeight * 0.5 / distance;
+            // Use the widest tracked FOV for the persistent spatial cut. Zoom changes drawing,
+            // not the resident geometry, so zooming out cannot discard a completed fine cut.
+            // Recover the rotation-independent focal length once per traversal, not per node.
+            double pixelsPerBlock = this.coveragePixels / distance;
             double apparentSide = size * pixelsPerBlock;
             return new Projection(false, apparentSide * apparentSide);
         }
@@ -408,6 +453,12 @@ public final class ExactCpuTraversal {
                 if (!outside) return false;
             }
             return true;
+        }
+
+        private static double focalScale(Matrix4fc matrix) {
+            return Math.sqrt((double) matrix.m01() * matrix.m01()
+                    + (double) matrix.m11() * matrix.m11()
+                    + (double) matrix.m21() * matrix.m21());
         }
 
         private static boolean allOutsideNear(double[] z) {

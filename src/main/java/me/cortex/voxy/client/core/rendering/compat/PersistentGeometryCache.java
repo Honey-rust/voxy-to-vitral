@@ -3,6 +3,7 @@ package me.cortex.voxy.client.core.rendering.compat;
 import me.cortex.voxy.client.core.rendering.building.VitrailCpuMeshEncoder;
 
 import java.util.Iterator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +25,8 @@ public final class PersistentGeometryCache implements AutoCloseable {
     private static final long DEFAULT_LIMIT_BYTES = 1792L * 1024L * 1024L;
 
     private final LinkedHashMap<Key, Entry> entries = new LinkedHashMap<>(256, 0.75F, true);
+    private record GeometryIdentity(long epoch, int geometryId) {}
+    private final Map<GeometryIdentity, Entry> latestVersions = new HashMap<>();
     private final long limitBytes;
     private long residentBytes;
     private long hits;
@@ -57,22 +60,21 @@ public final class PersistentGeometryCache implements AutoCloseable {
         return new Lease(this, entry, false);
     }
 
+    /** Read-only prefetch probe; does not alter leases or LRU order. */
+    public synchronized boolean contains(Key key) { return this.entries.containsKey(key); }
+
     public synchronized Stats stats() {
         return new Stats(this.entries.size(), this.residentBytes, this.hits, this.misses);
     }
 
     private void invalidateOlderVersions(Key current) {
-        Iterator<Map.Entry<Key, Entry>> iterator = this.entries.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Entry entry = iterator.next().getValue();
-            if (entry.key.equals(current)) continue;
-            if (entry.key.rendererEpoch == current.rendererEpoch
-                    && entry.key.geometryId == current.geometryId) {
-                entry.stale = true;
-                if (entry.references == 0) {
-                    iterator.remove();
-                    release(entry);
-                }
+        // Earlier versions were already invalidated as their successors arrived.
+        GeometryIdentity identity = new GeometryIdentity(current.rendererEpoch, current.geometryId);
+        Entry previous = this.latestVersions.put(identity, this.entries.get(current));
+        if (previous != null && !previous.key.equals(current)) {
+            previous.stale = true;
+            if (previous.references == 0 && this.entries.remove(previous.key, previous)) {
+                release(previous);
             }
         }
     }
@@ -89,15 +91,32 @@ public final class PersistentGeometryCache implements AutoCloseable {
     }
 
     private synchronized void releaseLease(Entry entry) {
+        releaseReference(entry);
+        evictToLimit();
+    }
+
+    /** Release a completed region with one eviction walk, instead of one walk per node. */
+    public synchronized void releaseLeases(List<Lease> leases) {
+        for (Lease lease : leases) {
+            if (lease.owner != this) throw new IllegalArgumentException("Foreign geometry lease");
+            Entry held = lease.entry;
+            if (held == null) continue;
+            lease.entry = null;
+            releaseReference(held);
+        }
+        evictToLimit();
+    }
+
+    private void releaseReference(Entry entry) {
         if (entry.references <= 0) throw new IllegalStateException("Geometry cache lease underflow");
         entry.references--;
         if (entry.references == 0 && entry.stale) {
             if (this.entries.remove(entry.key, entry)) release(entry);
         }
-        evictToLimit();
     }
 
     private void release(Entry entry) {
+        this.latestVersions.remove(new GeometryIdentity(entry.key.rendererEpoch, entry.key.geometryId), entry);
         this.residentBytes -= entry.bytes;
         entry.meshes.forEach(VitrailCpuMeshEncoder.Mesh::close);
     }
@@ -108,6 +127,7 @@ public final class PersistentGeometryCache implements AutoCloseable {
             entry.meshes.forEach(VitrailCpuMeshEncoder.Mesh::close);
         }
         this.entries.clear();
+        this.latestVersions.clear();
         this.residentBytes = 0;
         this.hits = 0;
         this.misses = 0;

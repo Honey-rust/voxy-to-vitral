@@ -10,7 +10,14 @@ public final class VitrailQuadEncoder {
 
     private VitrailQuadEncoder() {}
 
-    public record Vertex(int x, int y, int z, int light, int colour, int material, int normal) {}
+    public record Vertex(int x, int y, int z, int light, int colour, int material, int normal, int fraction) {
+        public Vertex(int x, int y, int z, int light, int colour, int material, int normal) {
+            this(x,y,z,light,colour,material,normal,0);
+        }
+        public double exactX() { return x + (fraction & 63) / 64.0; }
+        public double exactY() { return y + ((fraction >>> 6) & 63) / 64.0; }
+        public double exactZ() { return z + ((fraction >>> 12) & 63) / 64.0; }
+    }
 
     @FunctionalInterface
     public interface QuadConsumer {
@@ -106,36 +113,29 @@ public final class VitrailQuadEncoder {
             int normal, boolean reverse, int tileBlocks, QuadConsumer output) {
         double firstAt = 0;
         while (firstAt < firstExtent - 1.0e-7) {
-            double[] rowBase = base.clone();
-            rowBase[firstAxis] += firstAt;
+            double firstCoordinate = base[firstAxis] + firstAt;
             double firstLength = Math.min(firstExtent - firstAt,
-                    nextTileBoundary(rowBase[firstAxis], tileBlocks) - rowBase[firstAxis]);
-
+                    nextTileBoundary(firstCoordinate, tileBlocks) - firstCoordinate);
             double secondAt = 0;
             while (secondAt < secondExtent - 1.0e-7) {
-                double[] start = rowBase.clone();
-                start[secondAxis] += secondAt;
+                double secondCoordinate = base[secondAxis] + secondAt;
                 double secondLength = Math.min(secondExtent - secondAt,
-                        nextTileBoundary(start[secondAxis], tileBlocks) - start[secondAxis]);
-
-                int sectionX = Math.floorDiv((int) Math.floor(start[0]), tileBlocks) * tileBlocks;
-                int sectionY = Math.floorDiv((int) Math.floor(start[1]), tileBlocks) * tileBlocks;
-                int sectionZ = Math.floorDiv((int) Math.floor(start[2]), tileBlocks) * tileBlocks;
-                double[] p0 = start;
-                double[] p1 = start.clone(); p1[firstAxis] += firstLength;
-                double[] p2 = start.clone(); p2[secondAxis] += secondLength;
-                double[] p3 = p1.clone(); p3[secondAxis] += secondLength;
-
-                // The DH format rounds to whole blocks. Epsilon-expanded faces can create
-                // a sub-block sliver at a tile boundary; do not submit collapsed triangles.
-                if (Math.round(p0[firstAxis]) != Math.round(p1[firstAxis])
-                        && Math.round(p0[secondAxis]) != Math.round(p2[secondAxis])) {
+                        nextTileBoundary(secondCoordinate, tileBlocks) - secondCoordinate);
+                double x = base[0] + (firstAxis == 0 ? firstAt : secondAxis == 0 ? secondAt : 0);
+                double y = base[1] + (firstAxis == 1 ? firstAt : secondAxis == 1 ? secondAt : 0);
+                double z = base[2] + (firstAxis == 2 ? firstAt : secondAxis == 2 ? secondAt : 0);
+                int sectionX = Math.floorDiv((int)Math.floor(x), tileBlocks) * tileBlocks;
+                int sectionY = Math.floorDiv((int)Math.floor(y), tileBlocks) * tileBlocks;
+                int sectionZ = Math.floorDiv((int)Math.floor(z), tileBlocks) * tileBlocks;
+                if (Math.round(firstCoordinate * 64.0) != Math.round((firstCoordinate + firstLength) * 64.0)
+                        && Math.round(secondCoordinate * 64.0) != Math.round((secondCoordinate + secondLength) * 64.0)) {
+                    double dx1 = firstAxis == 0 ? firstLength : 0, dy1 = firstAxis == 1 ? firstLength : 0, dz1 = firstAxis == 2 ? firstLength : 0;
+                    double dx2 = secondAxis == 0 ? secondLength : 0, dy2 = secondAxis == 1 ? secondLength : 0, dz2 = secondAxis == 2 ? secondLength : 0;
                     output.accept(sectionX, sectionY, sectionZ,
-                            vertex(p0, sectionX, sectionY, sectionZ, light, colour, material, normal),
-                            vertex(p1, sectionX, sectionY, sectionZ, light, colour, material, normal),
-                            vertex(p2, sectionX, sectionY, sectionZ, light, colour, material, normal),
-                            vertex(p3, sectionX, sectionY, sectionZ, light, colour, material, normal),
-                            reverse);
+                            vertex(x,y,z,sectionX,sectionY,sectionZ,light,colour,material,normal),
+                            vertex(x+dx1,y+dy1,z+dz1,sectionX,sectionY,sectionZ,light,colour,material,normal),
+                            vertex(x+dx2,y+dy2,z+dz2,sectionX,sectionY,sectionZ,light,colour,material,normal),
+                            vertex(x+dx1+dx2,y+dy1+dy2,z+dz1+dz2,sectionX,sectionY,sectionZ,light,colour,material,normal), reverse);
                 }
                 secondAt += secondLength;
             }
@@ -147,11 +147,14 @@ public final class VitrailQuadEncoder {
         return (Math.floor(coordinate / tileBlocks) + 1.0) * tileBlocks;
     }
 
-    private static Vertex vertex(double[] point, int sectionX, int sectionY, int sectionZ,
+    private static Vertex vertex(double px, double py, double pz, int sectionX, int sectionY, int sectionZ,
             int light, int colour, int material, int normal) {
-        return new Vertex((int) Math.round(point[0] - sectionX),
-                (int) Math.round(point[1] - sectionY),
-                (int) Math.round(point[2] - sectionZ), light, colour, material, normal);
+        long x = Math.round((px - sectionX) * 64.0);
+        long y = Math.round((py - sectionY) * 64.0);
+        long z = Math.round((pz - sectionZ) * 64.0);
+        int fraction = (int)(x & 63) | ((int)(y & 63) << 6) | ((int)(z & 63) << 12);
+        return new Vertex((int)(x >> 6), (int)(y >> 6), (int)(z >> 6),
+                light, colour, material, normal, fraction);
     }
 
     private static double[] swizzle(int axis, double x, double y, double z) {

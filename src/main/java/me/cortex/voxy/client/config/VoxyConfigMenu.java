@@ -25,6 +25,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
         if (!VoxyCommon.isAvailable()) return;//Dont even register the config if its not avalible
 
         var CFG = VoxyConfig.CONFIG;
+        boolean vulkan = me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive();
 
         var cc = B.registerModOptions("voxy", "Voxy", VoxyCommon.MOD_VERSION)
                 .setIcon(Identifier.parse("voxy:icon.png"));
@@ -101,9 +102,10 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                                 new IntOption(
                                         "voxy:subdivsize",
                                         Component.translatable("voxy.config.general.subDivisionSize"),
-                                        ()->subDiv2ln(CFG.subDivisionSize), v->CFG.subDivisionSize=ln2subDiv(v),
-                                        new Range(0, SUBDIV_IN_MAX, 1))
-                                        .setFormatter(v->Component.literal(Integer.toString(Math.round(ln2subDiv(v)))))
+                                        ()->Math.round(CFG.subDivisionSize), v->CFG.subDivisionSize=v,
+                                        new Range(28, 256, 1))
+                                        .setTooltipSupplier(v -> Component.literal("细分阈值越小，LOD 越精细，加载和渲染负载越高。缩放会继续请求更细层级，直到最细 level 0。"))
+                                        .setFormatter(v->Component.literal(Integer.toString(v)))
                                         .setImpact(OptionImpact.HIGH),
                                 new IntOption(
                                         "voxy:render_distance",
@@ -121,7 +123,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                                             }
                                         }, "voxy:rendering", RENDER_RELOAD)
                                         .setImpact(OptionImpact.MEDIUM)
-                        ), new Group(
+                        ), new Group(vulkan ? new Option[0] : new Option[] {
                                 new EnumOption<>(
                                         "voxy:eviromental_fog",
                                         NormalRenderPipeline.FogMode.class,
@@ -136,7 +138,7 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                                         .setNameProvider(c->Component.translatable("voxy.config.general.ssao_mode."+c.name().toLowerCase(Locale.ROOT)))
                                         .setImpact(OptionImpact.MEDIUM)//TODO make it on igpus this is high
                                         .setPostChangeFlags(RENDER_RELOAD)
-                        ).setEnablerInherit(s->!IrisUtil.irisShadersEnabledInConfig(), ConfigState.UPDATE_ON_REBUILD)
+                        }).setEnablerInherit(s->!IrisUtil.irisShadersEnabledInConfig(), ConfigState.UPDATE_ON_REBUILD)
                 ).setEnablerAND("voxy:enabled", "voxy:rendering"));
 
     }

@@ -273,17 +273,17 @@ public final class VitrailCpuMeshEncoder {
             long ptr = vertices.address + (long) vertexCount * VERTEX_STRIDE;
             writeVertex(ptr, v0, nearSuppression); writeVertex(ptr + VERTEX_STRIDE, v1, nearSuppression);
             writeVertex(ptr + VERTEX_STRIDE * 2L, v2, nearSuppression); writeVertex(ptr + VERTEX_STRIDE * 3L, v3, nearSuppression);
-            VitrailQuadEncoder.Vertex[] corners = {v0, v1, v2, v3};
             for (int i = 0; i < 4; i++) {
-                var v = corners[i];
+                var v = switch (i) { case 0 -> v0; case 1 -> v1; case 2 -> v2; default -> v3; };
                 int axis = v.normal() >> 1;
                 float scale = 1 << lod;
-                float u = (axis == 2 ? v.y() : v.x()) / scale;
-                float w = (axis == 1 ? v.y() : v.z()) / scale;
+                float u = (float)(axis == 2 ? v.exactY() : v.exactX()) / scale;
+                float w = (float)(axis == 1 ? v.exactY() : v.exactZ()) / scale;
                 long d = detail.address + (long)(vertexCount + i) * 16;
                 MemoryUtil.memPutFloat(d, u);
                 MemoryUtil.memPutFloat(d + 4, w);
-                MemoryUtil.memPutInt(d + 8, tile);
+                // 14 tile bits + 18 position bits, without growing the 16-byte detail stream.
+                MemoryUtil.memPutInt(d + 8, tile | (v.fraction() << 14));
                 MemoryUtil.memPutByte(d + 12, (byte)(average >>> 16));
                 MemoryUtil.memPutByte(d + 13, (byte)(average >>> 8));
                 MemoryUtil.memPutByte(d + 14, (byte)average);

@@ -33,6 +33,7 @@ public class VoxyConfig {
     public float sectionRenderDistance = 16;
     public int serviceThreads = (int) Math.max(CpuLayout.getCoreCount()/1.5, 1);
     public float subDivisionSize = 64;
+    public int vitrailSettingsVersion;
     public String fogMode;
     public boolean dontUseSodiumBuilderThreads = false;
     public String ssaoMode;
@@ -70,6 +71,7 @@ public class VoxyConfig {
                 try (FileReader reader = new FileReader(path.toFile())) {
                     var conf = GSON.fromJson(reader, VoxyConfig.class);
                     if (conf != null) {
+                        conf.migrateVitrailSettings();
                         conf.save();
                         return conf;
                     } else {
@@ -85,6 +87,7 @@ public class VoxyConfig {
                 Logger.info("Config file doesnt exist, creating new");
             }
             var config = new VoxyConfig();
+            config.migrateVitrailSettings();
             config.save();
             return config;
         } else {
@@ -105,6 +108,17 @@ public class VoxyConfig {
             Files.writeString(getConfigPath(), GSON.toJson(this));
         } catch (IOException e) {
             Logger.error("Failed to write config file", e);
+        }
+    }
+
+    public void migrateVitrailSettings() {
+        if (this.vitrailSettingsVersion == 0
+                && me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            // Preserve the previous effective quality once, then honor all future UI changes.
+            this.subDivisionSize = Math.max(192.0F, this.subDivisionSize);
+            this.vitrailSettingsVersion = 1;
+            Logger.info("Vitrail subdivision setting migrated to previous effective value: " + this.subDivisionSize);
+            this.save();
         }
     }
 

@@ -237,7 +237,7 @@ public class AsyncNodeManager {
             this.tlnLock.unlockWrite(stamp);
             int work = 0;
             if (rem != null) {
-                var iter = rem.longIterator();
+                var iter = rem.iterator();
                 while (iter.hasNext()) {
                     this.manager.removeTopLevelNode(iter.nextLong());
                     work++;
@@ -245,7 +245,7 @@ public class AsyncNodeManager {
             }
 
             if (add != null) {
-                var iter = add.longIterator();
+                var iter = add.iterator();
                 while (iter.hasNext()) {
                     this.manager.insertTopLevelNode(iter.nextLong());
                     work++;
@@ -423,7 +423,7 @@ public class AsyncNodeManager {
             // merge with the previous result set
 
             if (!this.tlnIdChange.isEmpty()) {//Merge top level node id changes
-                var iter = this.tlnIdChange.intIterator();
+                var iter = this.tlnIdChange.iterator();
                 while (iter.hasNext()) {
                     int val = iter.nextInt();
                     if (!results.tlnDelta.remove(val ^ (1 << 31))) {//Remove opposite
@@ -434,7 +434,7 @@ public class AsyncNodeManager {
             }
 
             if (!this.cleanerIdResetClear.isEmpty()) {//Merge top level node id changes
-                var iter = this.cleanerIdResetClear.intIterator();
+                var iter = this.cleanerIdResetClear.iterator();
                 while (iter.hasNext()) {
                     int val = iter.nextInt();
                     results.cleanerOperations.remove(val^(1<<31));//Remove opposite
@@ -445,7 +445,7 @@ public class AsyncNodeManager {
 
             if (!this.geometryManager.getHeapRemovals().isEmpty()) {//Remove and free all the removed geometry uploads
                 var rem = this.geometryManager.getHeapRemovals();
-                var iter = rem.intIterator();
+                var iter = rem.iterator();
                 while (iter.hasNext()) {
                     results.geometryUpload.remove(iter.nextInt());
                 }
@@ -468,7 +468,7 @@ public class AsyncNodeManager {
             //Geometry id metadata updates
             if (!this.geometryManager.getUpdateIds().isEmpty()) {
                 var ids = this.geometryManager.getUpdateIds();
-                var iter = ids.intIterator();
+                var iter = ids.iterator();
                 while (iter.hasNext()) {
                     int val = iter.nextInt();
                     int scatterAddr = (val<<1)|(1<<31);//Since we write to the second buffer
@@ -486,7 +486,7 @@ public class AsyncNodeManager {
             //Node updates
             if (!this.manager.getNodeUpdates().isEmpty()) {
                 var ids = this.manager.getNodeUpdates();
-                var iter = ids.intIterator();
+                var iter = ids.iterator();
                 while (iter.hasNext()) {
                     int val = iter.nextInt();
                     //Dont need to modify the write location since we write to buffer 0
@@ -533,7 +533,7 @@ public class AsyncNodeManager {
 
         //top level node add/remove
         if (!results.tlnDelta.isEmpty()) {
-            var iter = results.tlnDelta.intIterator();
+            var iter = results.tlnDelta.iterator();
             while (iter.hasNext()) {
                 int val = iter.nextInt();
                 if ((val&(1<<31))!=0) {//Add node
@@ -671,6 +671,10 @@ public class AsyncNodeManager {
         return this.geometryManager.getCpuSectionSnapshot(geometryId);
     }
 
+    public BuiltSection getCpuSectionSnapshot(int geometryId, long expectedVersion) {
+        return this.geometryManager.getCpuSectionSnapshot(geometryId, expectedVersion);
+    }
+
     public List<NodeManager.GeometryNode> getCpuGeometryNodesSnapshot() {
         return this.cpuGeometryNodes;
     }
@@ -745,14 +749,18 @@ public class AsyncNodeManager {
         }
     }
 
+    // Render-thread scratch only. The pending set remains concurrent because worker events
+    // can change it; this membership snapshot is never shared with the worker.
+    private final LongOpenHashSet cpuActiveLeafScratch = new LongOpenHashSet();
+
     /** Drops CPU deduplication entries after their leaf has expanded or left the active graph. */
     public void synchronizeCpuRefinementRequests(List<NodeManager.GeometryNode> nodes) {
         if (this.cpuRefinementPending.isEmpty()) return;
-        Set<Long> activeLeaves = ConcurrentHashMap.newKeySet(nodes.size());
+        this.cpuActiveLeafScratch.clear();
         for (NodeManager.GeometryNode node : nodes) {
-            if (!node.inner()) activeLeaves.add(node.position());
+            if (!node.inner()) this.cpuActiveLeafScratch.add(node.position());
         }
-        this.cpuRefinementPending.removeIf(position -> !activeLeaves.contains(position));
+        this.cpuRefinementPending.removeIf(position -> !this.cpuActiveLeafScratch.contains(position.longValue()));
     }
 
     private void submitChildChange(WorldSection section) {

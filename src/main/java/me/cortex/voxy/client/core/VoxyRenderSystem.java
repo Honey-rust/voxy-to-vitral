@@ -97,7 +97,11 @@ public class VoxyRenderSystem {
     private int vitrailProjectionHeight = -1;
     private final ExactCpuTraversal vitrailShadowTraversal = new ExactCpuTraversal();
     private final ExactCpuTraversal vitrailCoarseTraversal = new ExactCpuTraversal();
+    private final ExactCpuTraversal vitrailPresentationTraversal = new ExactCpuTraversal();
     private volatile ExactTraversalSnapshot vitrailExactSnapshot = ExactTraversalSnapshot.EMPTY;
+    private long vitrailNextSelectionNanos;
+    private long vitrailSelectionSerial;
+    public long getVitrailSelectionSerial() { return this.vitrailSelectionSerial; }
     private volatile ExactTraversalSnapshot vitrailCoarseSnapshot = ExactTraversalSnapshot.EMPTY;
     private volatile ExactCpuTraversal.Stats vitrailShadowStats = ExactCpuTraversal.Stats.EMPTY;
     // The compatibility path submits ordinary indexed draws instead of Voxy's native GPU driven
@@ -148,6 +152,7 @@ public class VoxyRenderSystem {
 
         // === Vitrail (Vulkan) 模式：启动纯 CPU 后台多线程数据生成引擎，跳过 OpenGL 着色器管线 ===
         if (isVitrail) {
+            VoxyConfig.CONFIG.migrateVitrailSettings();
             this.worldIn = world;
             this.properties = RenderProperties.getRenderProperties();
             this.visbleSectionStream = new StreamedBoundStore();
@@ -348,10 +353,39 @@ public class VoxyRenderSystem {
     }
 
     /** Updates the Vulkan compatibility view without changing Voxy's original GL traversal. */
+    private long cpuTickSamples, cpuTickNanos, cpuTickPeak, cpuTickOver8ms, cpuTickReport;
+    private long cpuQueueThisCall, cpuSelectionThisCall, cpuQueuePeak, cpuSelectionPeak;
     public void tickVitrail(@Nullable Matrix4fc projection, @Nullable Matrix4fc modelView,
+            int width, int height, double cameraX, double cameraY, double cameraZ) {
+        if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) return;
+        long start = System.nanoTime();
+        this.cpuQueueThisCall = this.cpuSelectionThisCall = 0;
+        try { tickVitrailInternal(projection, modelView, width, height, cameraX, cameraY, cameraZ); }
+        finally {
+            long elapsed = System.nanoTime() - start;
+            this.cpuTickSamples++; this.cpuTickNanos += elapsed;
+            this.cpuQueuePeak = Math.max(this.cpuQueuePeak, this.cpuQueueThisCall);
+            this.cpuSelectionPeak = Math.max(this.cpuSelectionPeak, this.cpuSelectionThisCall);
+            this.cpuTickPeak = Math.max(this.cpuTickPeak, elapsed);
+            if (elapsed > 8_000_000L) this.cpuTickOver8ms++;
+            if (this.cpuTickReport == 0) this.cpuTickReport = start + 5_000_000_000L;
+            if (start >= this.cpuTickReport) {
+                Logger.info("Voxy tick CPU: " + this.cpuTickSamples + " frames, avg "
+                        + this.cpuTickNanos / this.cpuTickSamples / 1000L + " us, peak " + this.cpuTickPeak / 1000L
+                        + " us, over8ms " + this.cpuTickOver8ms + "; queue/selection peak "
+                        + this.cpuQueuePeak / 1000L + "/" + this.cpuSelectionPeak / 1000L + " us");
+                this.cpuTickSamples = this.cpuTickNanos = this.cpuTickPeak = this.cpuTickOver8ms = 0;
+                this.cpuQueuePeak = this.cpuSelectionPeak = 0;
+                this.cpuTickReport = start + 5_000_000_000L;
+            }
+        }
+    }
+
+    private void tickVitrailInternal(@Nullable Matrix4fc projection, @Nullable Matrix4fc modelView,
             int width, int height,
             double cameraX, double cameraY, double cameraZ) {
         if (!me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) return;
+        long queueStarted = System.nanoTime();
         this.vitrailCameraX = cameraX;
         this.vitrailCameraY = cameraY;
         this.vitrailCameraZ = cameraZ;
@@ -379,6 +413,14 @@ public class VoxyRenderSystem {
         }
         if (this.nodeManager != null) {
             this.nodeManager.tickCpuOnly();
+            this.cpuQueueThisCall = System.nanoTime() - queueStarted;
+            // Drawing still reads the current view every frame. Refresh the asynchronous spatial
+            // cut at 25 Hz, keeping completed geometry between updates.
+            long selectionNow = System.nanoTime();
+            if (selectionNow < this.vitrailNextSelectionNanos) return;
+            this.vitrailNextSelectionNanos = selectionNow + 40_000_000L;
+            long selectionStarted = System.nanoTime();
+            try {
             double maximumDistance = VoxyConfig.CONFIG.sectionRenderDistance * 16.0 * 32.0;
             var geometryNodes = this.nodeManager.getCpuGeometryNodesSnapshot();
             this.nodeManager.synchronizeCpuRefinementRequests(geometryNodes);
@@ -387,52 +429,44 @@ public class VoxyRenderSystem {
             if (shadowMatrix != null && coverageMatrix != null && width > 0 && height > 0) {
                 HierarchyView hierarchy = this.nodeManager.getCpuHierarchyViewSnapshot();
                 double baseSubdivision = Math.max(1.0, VoxyConfig.CONFIG.subDivisionSize);
-                if (!Double.isFinite(this.vitrailAdaptiveSubdivisionPixels)
-                        || this.vitrailAdaptiveSubdivisionPixels < baseSubdivision) {
-                    this.vitrailAdaptiveSubdivisionPixels = baseSubdivision;
-                }
-                this.vitrailAdaptiveSubdivisionPixels = Math.min(
-                        Math.max(baseSubdivision, VITRAIL_MAX_ADAPTIVE_SUBDIVISION_PIXELS),
-                        this.vitrailAdaptiveSubdivisionPixels);
-                double subdivision = this.vitrailAdaptiveSubdivisionPixels;
+                // Stable spatial quality: an asynchronous all-direction provider cannot
+                // change its global threshold in response to the selected count every frame.
+                // The migrated setting preserves quality without a hidden clamp.
+                double subdivision = baseSubdivision;
+                this.vitrailAdaptiveSubdivisionPixels = subdivision;
                 var exact = this.vitrailShadowTraversal.traverse(hierarchy,
                         new ExactCpuTraversal.Parameters(shadowMatrix, coverageMatrix, width, height,
                                 cameraX, cameraY, cameraZ, maximumDistance, subdivision));
-                // The native renderer can submit a very large exact cut through indirect draws.
-                // The compatibility path uses ordinary indexed draws, so raise the screen-space
-                // threshold just enough to keep its complete hierarchy cut within a practical
-                // node budget. This coarsens coverage instead of truncating it.
-                // One corrective pass is enough.  Keep the corrected value for the next frame so
-                // traversal hysteresis sees one coherent threshold instead of several different
-                // thresholds in a single frame.
-                if (exact.selectedNodeIds().size() > VITRAIL_VISIBLE_NODE_BUDGET) {
-                    double pressure = Math.sqrt((double) exact.selectedNodeIds().size()
-                            / (VITRAIL_VISIBLE_NODE_BUDGET * 0.88));
-                    subdivision = Math.min(
-                            Math.max(baseSubdivision, VITRAIL_MAX_ADAPTIVE_SUBDIVISION_PIXELS),
-                            subdivision * Math.min(1.20, Math.max(1.025, pressure)));
-                    this.vitrailAdaptiveSubdivisionPixels = subdivision;
-                    exact = this.vitrailShadowTraversal.traverse(hierarchy,
-                            new ExactCpuTraversal.Parameters(shadowMatrix, coverageMatrix, width, height,
-                                    cameraX, cameraY, cameraZ, maximumDistance, subdivision));
-                } else if (exact.selectedNodeIds().size() < VITRAIL_VISIBLE_NODE_BUDGET * 0.68
-                        && subdivision > baseSubdivision) {
-                    // Recover detail slowly after hierarchy/request pressure falls.  The dead band
-                    // prevents the full render list from being rebuilt for tiny count changes.
-                    this.vitrailAdaptiveSubdivisionPixels = Math.max(baseSubdivision,
-                            subdivision * 0.985);
+                var frontier = VitrailBridge.getPresentationRefinementFrontier();
+                boolean needsPresentation = false;
+                for (int id : exact.selectedNodeIds()) {
+                    var node = hierarchy.node(id);
+                    if (node == null || node.level() == WorldEngine.MAX_LOD_LAYER) continue;
+                    long position = node.packedPosition();
+                    long parent = WorldEngine.getWorldSectionId(node.level() + 1,
+                            WorldEngine.getX(position) >> 1, WorldEngine.getY(position) >> 1,
+                            WorldEngine.getZ(position) >> 1);
+                    if (!frontier.contains(parent)) { needsPresentation = true; break; }
                 }
-                this.vitrailExactSnapshot = new ExactTraversalSnapshot(hierarchy, exact);
+                // Once the target cut is at most one layer ahead, reuse normal selection.
+                // Stable views do not pay for a second full hierarchy traversal.
+                var presentation = needsPresentation ? this.vitrailPresentationTraversal.traverse(hierarchy,
+                        new ExactCpuTraversal.Parameters(shadowMatrix, coverageMatrix, width, height,
+                                cameraX, cameraY, cameraZ, maximumDistance, subdivision), frontier) : exact;
+                this.vitrailExactSnapshot = new ExactTraversalSnapshot(hierarchy, presentation);
                 this.vitrailShadowStats = exact.stats();
                 this.vitrailEffectiveSubdivisionPixels = subdivision;
 
                 // A cheap, complete first stage mirrors Voxy's coarse-to-fine presentation. It is
                 // built from the same hierarchy and coverage rules, only with a coarser threshold.
+                if (!VitrailBridge.hasCompleteBaseline()) {
                 var coarse = this.vitrailCoarseTraversal.traverse(hierarchy,
                         new ExactCpuTraversal.Parameters(shadowMatrix, coverageMatrix, width, height,
                                 cameraX, cameraY, cameraZ, maximumDistance,
                                 Math.max(256.0, subdivision * 4.0)));
                 this.vitrailCoarseSnapshot = new ExactTraversalSnapshot(hierarchy, coarse);
+                }
+                this.vitrailSelectionSerial++;
 
                 // traversal_dev advances one hierarchy layer per dispatch.  Preserve that visible
                 // behaviour on CPU: establish broad coarse coverage first, then refine the roots
@@ -441,23 +475,28 @@ public class VoxyRenderSystem {
                 // coarse for a long time.
                 java.util.ArrayList<Integer> requestedNodeIds = new java.util.ArrayList<>(
                         exact.requestedNodeIds());
+                boolean zoomRequests = this.vitrailProjectionScalePixels
+                        > this.vitrailWidestProjectionScalePixels * 1.25;
+                var requestView = new org.joml.FrustumIntersection(shadowMatrix);
+                record RequestPriority(int visibility, int level, double distance) {}
+                java.util.HashMap<Integer, RequestPriority> priorities = new java.util.HashMap<>();
+                for (int nodeId : requestedNodeIds) {
+                    HierarchyView.Node node = hierarchy.node(nodeId);
+                    if (node == null) { priorities.put(nodeId, new RequestPriority(1, -1, Double.POSITIVE_INFINITY)); continue; }
+                    int size = 32 << node.level();
+                    double minX = WorldEngine.getX(node.packedPosition()) * (double)size;
+                    double minY = WorldEngine.getY(node.packedPosition()) * (double)size;
+                    double minZ = WorldEngine.getZ(node.packedPosition()) * (double)size;
+                    float x = (float)(minX - cameraX), y = (float)(minY - cameraY), z = (float)(minZ - cameraZ);
+                    int visibility = !zoomRequests || requestView.intersectAab(x, y, z, x + size, y + size, z + size, 0x0f) < 0 ? 0 : 1;
+                    double dx = Math.max(0, Math.max(minX - cameraX, cameraX - minX - size));
+                    double dz = Math.max(0, Math.max(minZ - cameraZ, cameraZ - minZ - size));
+                    priorities.put(nodeId, new RequestPriority(visibility, node.level(), dx * dx + dz * dz));
+                }
                 requestedNodeIds.sort(java.util.Comparator
-                        .<Integer>comparingInt(nodeId -> {
-                            HierarchyView.Node node = hierarchy.node(nodeId);
-                            return node == null ? -1 : node.level();
-                        }).reversed()
-                        .thenComparingDouble(nodeId -> {
-                            HierarchyView.Node node = hierarchy.node(nodeId);
-                            if (node == null) return Double.POSITIVE_INFINITY;
-                            double size = 32.0 * (1L << node.level());
-                            double minX = WorldEngine.getX(node.packedPosition()) * size;
-                            double minZ = WorldEngine.getZ(node.packedPosition()) * size;
-                            double dx = cameraX < minX ? minX - cameraX
-                                    : cameraX > minX + size ? cameraX - minX - size : 0.0;
-                            double dz = cameraZ < minZ ? minZ - cameraZ
-                                    : cameraZ > minZ + size ? cameraZ - minZ - size : 0.0;
-                            return dx * dx + dz * dz;
-                        }));
+                        .<Integer>comparingInt(id -> priorities.get(id).visibility())
+                        .thenComparing(java.util.Comparator.<Integer>comparingInt(id -> priorities.get(id).level()).reversed())
+                        .thenComparingDouble(id -> priorities.get(id).distance()));
                 java.util.ArrayList<Long> requests = new java.util.ArrayList<>(requestedNodeIds.size());
                 for (int nodeId : requestedNodeIds) {
                     HierarchyView.Node node = hierarchy.node(nodeId);
@@ -471,6 +510,9 @@ public class VoxyRenderSystem {
                                 0.0, maximumDistance,
                                 this.vitrailProjectionScalePixels, this.getVitrailSubdivisionPixels(),
                                 this.vitrailViewProjection));
+            }
+            } finally {
+                this.cpuSelectionThisCall = System.nanoTime() - selectionStarted;
             }
         }
         if (this.modelService != null) this.modelService.tick(900_000);
@@ -527,7 +569,21 @@ public class VoxyRenderSystem {
         if (!VITRAIL_LEGACY_SELECTOR) {
             ExactTraversalSnapshot snapshot = this.vitrailExactSnapshot;
             if (snapshot.hierarchy().epoch() != 0) {
-                return nodesFromExactSnapshot(snapshot, minimumLevel);
+                // A resident coarse parent is only a loading fallback when it reaches the camera.
+                // Wait for its finer cut instead of cutting a circular hole into its triangles.
+                var nodes = nodesFromExactSnapshot(snapshot, minimumLevel);
+                return nodes.stream().filter(node -> {
+                    int level = WorldEngine.getLevel(node.position());
+                    if (level == 0) return true;
+                    double size = 32.0 * (1L << level);
+                    double x = WorldEngine.getX(node.position()) * size;
+                    double y = WorldEngine.getY(node.position()) * size;
+                    double z = WorldEngine.getZ(node.position()) * size;
+                    double dx = Math.max(0, Math.max(x - cameraX, cameraX - x - size));
+                    double dy = Math.max(0, Math.max(y - this.vitrailCameraY, this.vitrailCameraY - y - size));
+                    double dz = Math.max(0, Math.max(z - cameraZ, cameraZ - z - size));
+                    return dx * dx + dy * dy + dz * dz >= 32.0 * 32.0;
+                }).toList();
             }
         }
         // sectionRenderDistance is scaled in 1/16-chunk steps. Voxy's own render path
@@ -596,6 +652,12 @@ public class VoxyRenderSystem {
             return null;
         }
         return this.nodeManager.getCpuSectionSnapshot(geometryId);
+    }
+
+    public me.cortex.voxy.client.core.rendering.building.BuiltSection
+    getVitrailCpuSectionSnapshot(int geometryId, long expectedVersion) {
+        if (!RenderBackend.isVitrailVulkanActive() || this.nodeManager == null) return null;
+        return this.nodeManager.getCpuSectionSnapshot(geometryId, expectedVersion);
     }
 
     /** Selects the current CPU LOD cut and returns caller-owned copies of those section meshes. */
