@@ -310,7 +310,9 @@ public final class VitrailBridge {
                 > Math.max(1.0, Math.abs(lastProjectionScalePixels) * 0.005);
         lastCameraX = cameraX;
         lastCameraZ = cameraZ;
+        double previousProjectionScalePixels = lastProjectionScalePixels;
         lastProjectionScalePixels = projectionScalePixels;
+        if (projectionChanged) loadPacing.responseUntil = now + 750_000_000L;
 
         // Finish published regions even during smooth zoom; cancellation rolls them back.
 
@@ -351,6 +353,8 @@ public final class VitrailBridge {
                 if (pendingFirstDirtyNanos == 0L) pendingFirstDirtyNanos = now;
                 if (pendingSinceNanos == 0L || cameraMoved || cutChanged) pendingSinceNanos = now;
                 if (projectionChanged) pendingSettleNanos = INITIAL_STREAM_DELAY_NANOS;
+                // A released zoom no longer needs its denser cut. Start the replacement promptly.
+                if (projectionChanged && projectionScalePixels < previousProjectionScalePixels) pendingSinceNanos = now - pendingSettleNanos;
                 // Let rapid turns settle so we refine the view the player actually stopped on.
                 // A hard deadline still publishes progress while chunks continue arriving.
                 if (now - pendingSinceNanos < pendingSettleNanos
@@ -366,7 +370,7 @@ public final class VitrailBridge {
             // Fill an empty view promptly. Once a complete cut is already displayed, spend a much
             // smaller slice of each frame refining it, matching Voxy's background-work policy and
             // avoiding a permanent 2 ms tax while the player moves or turns.
-            long frameBudget = loadPacing.budget();
+            long frameBudget = loadPacing.budget(!hasCompleteBaseline || now < loadPacing.responseUntil);
             long workStarted = System.nanoTime();
             AggregatePair rebuilt;
             try { rebuilt = build.advance(frameBudget); }
@@ -480,13 +484,14 @@ public final class VitrailBridge {
     }
 
     private static final class LoadPacing {
-        private long previousFrame, workNanos;
+        private long previousFrame, workNanos, responseUntil, bootstrapUntil;
         private double baseFrameNanos = 8_333_333.0, recentFrameNanos = 8_333_333.0;
         private void reset() {
-            previousFrame = workNanos = 0;
+            previousFrame = workNanos = responseUntil = bootstrapUntil = 0;
             baseFrameNanos = recentFrameNanos = 8_333_333.0;
         }
         private void frame(long now) {
+            if (previousFrame == 0) bootstrapUntil = now + 20_000_000_000L;
             if (previousFrame != 0) {
                 long elapsed = now - previousFrame;
                 // Ignore menus/world transitions, but react immediately to ordinary spikes.
@@ -499,13 +504,17 @@ public final class VitrailBridge {
             previousFrame = now;
             workNanos = 0;
         }
-        private long budget() {
+        private long budget(boolean responsive) {
+            responsive |= System.nanoTime() < bootstrapUntil;
             int limit = net.minecraft.client.Minecraft.getInstance().options.framerateLimit().get();
             int target = limit > 0 && limit < 120 ? limit : 120;
             double frameTarget = 1_000_000_000.0 / Math.max(30, target);
-            if (recentFrameNanos > frameTarget * 1.20) return 150_000L;
+            // A 120 FPS target must not starve initial coverage on a slower shader frame.
+            // Allow bounded progress, while backing off again after a genuine long frame.
+            long floor = responsive && recentFrameNanos < 20_000_000.0 ? 650_000L : 150_000L;
+            if (recentFrameNanos > frameTarget * 1.20) return floor;
             double spare = frameTarget * 0.94 - baseFrameNanos;
-            return (long)Math.max(200_000.0, Math.min(2_000_000.0, spare * 0.65));
+            return (long)Math.max(Math.max(200_000L, floor), Math.min(2_000_000.0, spare * 0.65));
         }
     }
 
@@ -539,6 +548,9 @@ public final class VitrailBridge {
         private long minBudgetNanos = Long.MAX_VALUE, maxBudgetNanos;
         private int workerWaitFrames;
         private double uploadNanosPerByte = 0.25;
+        private GpuBuffer uploadVertex, uploadIndices, uploadDetail;
+        private GpuTextureView uploadAtlas;
+        private int uploadStage;
         private volatile long maxWorkerEncodeNanos, maxPrepareNanos;
         private final Map<NodeStamp, java.util.concurrent.CompletableFuture<List<VitrailCpuMeshEncoder.Mesh>>> encodings = new LinkedHashMap<>();
         private final java.util.ArrayDeque<java.util.concurrent.CompletableFuture<PreparedUpload>> preparedQueue = new java.util.ArrayDeque<>();
@@ -669,15 +681,21 @@ public final class VitrailBridge {
                     var future = this.preparedQueue.peekFirst();
                     if (!future.isDone()) { this.workerWaitFrames++; return null; }
                     PreparedUpload prepared = future.join();
-                    long bytes = prepared.cached == null ? prepared.mesh.vertices().size + prepared.mesh.indices().size + prepared.mesh.detail().size : 0;
-                    long estimate = prepared.cached == null ? (long)Math.max(80_000.0, bytes * this.uploadNanosPerByte) : 5_000L;
+                    long bytes = prepared.cached != null ? 0 : switch (this.uploadStage) {
+                        case 0 -> prepared.mesh.vertices().size;
+                        case 1 -> prepared.mesh.indices().size;
+                        case 2 -> prepared.mesh.detail().size;
+                        default -> 0;
+                    };
+                    long estimate = prepared.cached == null && this.uploadStage < 3 ? (long)Math.max(20_000.0, bytes * this.uploadNanosPerByte) : 5_000L;
                     if (didWork && deadline - System.nanoTime() < estimate) return null;
                     // With pending uploads, the next advance skips prefetch and starts with
                     // didWork=false, guaranteeing forward progress for one indivisible task.
-                    this.preparedQueue.removeFirst();
                     long uploadStarted = System.nanoTime();
-                    upload(prepared);
-                    this.uploadIndex++;
+                    if (uploadStep(prepared)) {
+                        this.preparedQueue.removeFirst();
+                        this.uploadIndex++;
+                    }
                     long elapsed = System.nanoTime() - uploadStarted;
                     this.maxUploadNanos = Math.max(this.maxUploadNanos, elapsed);
                     if (bytes > 0) this.uploadNanosPerByte += (elapsed / (double)bytes - this.uploadNanosPerByte) * 0.20;
@@ -827,46 +845,50 @@ public final class VitrailBridge {
             }
         }
 
-        private void upload(PreparedUpload prepared) throws ReflectiveOperationException {
+        /** One indivisible GPU operation at a time; only publish a fully uploaded piece. */
+        private boolean uploadStep(PreparedUpload prepared) throws ReflectiveOperationException {
             if (prepared.cached != null) {
-                // Transfer the queue's pinned reference to the next aggregate.
                 (prepared.key.parts.getFirst().opaque() ? this.opaqueUploaded : this.translucentUploaded).add(prepared.cached);
-                return;
+                return true;
             }
             VitrailCpuMeshEncoder.Mesh mesh = prepared.mesh;
-            boolean combined = prepared.owned;
-            GpuBuffer vertex = null;
-            GpuBuffer index = null;
-            GpuBuffer detail = null;
-            try {
-                vertex = this.device.createBuffer(() -> "Voxy Vitrail aggregate vertices", GpuBuffer.USAGE_VERTEX,
+            switch (this.uploadStage) {
+                case 0 -> this.uploadVertex = this.device.createBuffer(() -> "Voxy Vitrail aggregate vertices", GpuBuffer.USAGE_VERTEX,
                         MemoryUtil.memByteBuffer(mesh.vertices().address, Math.toIntExact(mesh.vertices().size)));
-                index = this.device.createBuffer(() -> "Voxy Vitrail aggregate indices", GpuBuffer.USAGE_INDEX,
+                case 1 -> this.uploadIndices = this.device.createBuffer(() -> "Voxy Vitrail aggregate indices", GpuBuffer.USAGE_INDEX,
                         MemoryUtil.memByteBuffer(mesh.indices().address, Math.toIntExact(mesh.indices().size)));
-                var atlas = atlasFor(this.renderer, this.device, mesh, prepared.tiles);
-                detail = this.device.createBuffer(() -> "Voxy aggregate LOD texture coordinates", GpuBuffer.USAGE_VERTEX,
+                case 2 -> this.uploadDetail = this.device.createBuffer(() -> "Voxy aggregate LOD texture coordinates", GpuBuffer.USAGE_VERTEX,
                         MemoryUtil.memByteBuffer(mesh.detail().address, Math.toIntExact(mesh.detail().size)));
-                int[] b = prepared.bounds;
-                Object bounds = boundsConstructor.newInstance((float)b[0], (float)b[1], (float)b[2],
-                        (float)b[3], (float)b[4], (float)b[5]);
-                Object apiPiece = pieceConstructor.newInstance(vertex, index, mesh.indexCount(), detail, atlas, bounds);
-                ArrayList<UploadedPiece> uploaded = mesh.opaque() ? this.opaqueUploaded : this.translucentUploaded;
-                UploadedPiece piece = new UploadedPiece(new TileKey(mesh.x(), mesh.y(), mesh.z()),
-                        this.regions.get(this.regionIndex).key, apiPiece, vertex, index, detail, prepared.key);
-                uploaded.add(piece);
-                rememberGpuPiece(prepared.key, piece, mesh.vertices().size + mesh.indices().size + mesh.detail().size);
-            } catch (RuntimeException | ReflectiveOperationException | Error e) {
-                if (vertex != null) vertex.close();
-                if (index != null) index.close();
-                if (detail != null) detail.close();
-                throw e;
-            } finally {
-                if (combined) mesh.close();
+                case 3 -> this.uploadAtlas = atlasFor(this.renderer, this.device, mesh, prepared.tiles);
+                default -> {
+                    int[] b = prepared.bounds;
+                    Object bounds = boundsConstructor.newInstance((float)b[0], (float)b[1], (float)b[2],
+                            (float)b[3], (float)b[4], (float)b[5]);
+                    Object apiPiece = pieceConstructor.newInstance(this.uploadVertex, this.uploadIndices,
+                            mesh.indexCount(), this.uploadDetail, this.uploadAtlas, bounds);
+                    UploadedPiece piece = new UploadedPiece(new TileKey(mesh.x(), mesh.y(), mesh.z()),
+                            this.regions.get(this.regionIndex).key, apiPiece, this.uploadVertex, this.uploadIndices,
+                            this.uploadDetail, prepared.key);
+                    (mesh.opaque() ? this.opaqueUploaded : this.translucentUploaded).add(piece);
+                    // Ownership is now with the aggregate; cancellation must not close it twice.
+                    this.uploadVertex = null; this.uploadIndices = null; this.uploadDetail = null;
+                    this.uploadAtlas = null; this.uploadStage = 0;
+                    rememberGpuPiece(prepared.key, piece, mesh.vertices().size + mesh.indices().size + mesh.detail().size);
+                    if (prepared.owned) mesh.close();
+                    return true;
+                }
             }
+            this.uploadStage++;
+            return false;
         }
 
         private void cancel() {
             if (this.transferred) return;
+            if (this.uploadVertex != null) this.uploadVertex.close();
+            if (this.uploadIndices != null) this.uploadIndices.close();
+            if (this.uploadDetail != null) this.uploadDetail.close();
+            this.uploadVertex = null; this.uploadIndices = null; this.uploadDetail = null;
+            this.uploadAtlas = null; this.uploadStage = 0;
             // Joining occurs only at teardown/failure. Leases cannot be freed under a worker.
             for (var future : this.encodings.values()) {
                 try { future.join().forEach(VitrailCpuMeshEncoder.Mesh::close); }

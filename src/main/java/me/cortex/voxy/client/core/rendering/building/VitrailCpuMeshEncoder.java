@@ -362,8 +362,8 @@ public final class VitrailCpuMeshEncoder {
         MemoryUtil.memPutShort(ptr, (short) vertex.x());
         MemoryUtil.memPutShort(ptr + 2, (short) vertex.y());
         MemoryUtil.memPutShort(ptr + 4, (short) vertex.z());
-        // Vitrail's DH-compatible nudge decoder uses bits 8-13; bit 15 is free.
-        MemoryUtil.memPutShort(ptr + 6, (short) ((vertex.light() & 0xff) | nearSuppression));
+        // Bits 8-13 encode nudges; bit 14 marks solid leaves, bit 15 suppresses near proxies.
+        MemoryUtil.memPutShort(ptr + 6, (short) ((vertex.light() & 0xff) | nearSuppression | (vertex.material() == 1 ? 0x4000 : 0)));
         int rgba = vertex.colour();
         MemoryUtil.memPutByte(ptr + 8, (byte) (rgba >>> 24));
         MemoryUtil.memPutByte(ptr + 9, (byte) (rgba >>> 16));

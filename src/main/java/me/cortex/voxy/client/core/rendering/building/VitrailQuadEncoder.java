@@ -73,6 +73,14 @@ public final class VitrailQuadEncoder {
         double depth = encodedDepth / 64.0;
         if (side == 1) depth = 1.0 - depth;
 
+        // Solid leaf proxies must meet on voxel boundaries. Baked silhouette/depth is
+        // useful for thin models, but inset leaf faces expose seams between adjacent voxels.
+        if (material == 1) { // DH_BLOCK_LEAVES
+            offsetX = offsetZ = 0.0;
+            sizeX = sizeZ = 1.0;
+            depth = side;
+        }
+
         // quad_util.glsl supplies vec3(faceSize.xz, depth): both in-plane offsets
         // precede the perpendicular depth before the axis swizzle.
         double[] start = swizzle(axis, offsetX, offsetZ, depth);

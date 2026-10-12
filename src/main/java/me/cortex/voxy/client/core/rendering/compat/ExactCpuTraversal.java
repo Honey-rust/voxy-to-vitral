@@ -28,6 +28,7 @@ public final class ExactCpuTraversal {
     private static final double FAR_DETAIL_START_FRACTION = 0.20;
     private static final double FAR_DETAIL_MAX_MULTIPLIER = 4.0;
 
+    private static final long ZOOM_DETAIL_NANOS = 400_000_000L;
     private static final long RETAINED_DETAIL_NANOS = 8_000_000_000L;
     private final Long2LongOpenHashMap lastViewedRefinementTime = new Long2LongOpenHashMap();
     private final Long2ObjectOpenHashMap<ZoomDetail> zoomDetails = new Long2ObjectOpenHashMap<>();
@@ -60,7 +61,7 @@ public final class ExactCpuTraversal {
         } else {
             this.zoomExitSince = 0;
         }
-        if (this.zoomExitSince != 0 && start - this.zoomExitSince >= 250_000_000L) {
+        if (this.zoomExitSince != 0 && start - this.zoomExitSince >= 120_000_000L) {
             // Retain encoded meshes in the cache, but stop selecting extra zoom-only detail.
             for (long position : this.zoomDetails.keySet()) this.lastViewedRefinementTime.remove(position);
             this.zoomDetails.clear();
@@ -211,13 +212,14 @@ public final class ExactCpuTraversal {
                     && !project(node, this.parameters.viewProjection).outsideFrustum;
             ZoomDetail zoom = this.zoomDetails.get(node.packedPosition());
             double detailFactor = zoom != null && this.nowNanos <= zoom.untilNanos() ? zoom.factor() : 1.0;
-            if (zoomVisible) detailFactor = Math.max(detailFactor, this.zoomFactor);
+            // Current visible zoom wins: partially zooming out must also reduce detail.
+            if (zoomVisible) detailFactor = this.zoomFactor;
             threshold /= detailFactor;
             boolean refine = node.level() != 0 && projection.pixelArea > threshold * threshold;
             if (refine) {
                 this.lastViewedRefinementTime.put(node.packedPosition(), this.nowNanos);
                 if (zoomVisible) this.zoomDetails.put(node.packedPosition(),
-                        new ZoomDetail(this.zoomFactor, this.nowNanos + RETAINED_DETAIL_NANOS));
+                        new ZoomDetail(this.zoomFactor, this.nowNanos + ZOOM_DETAIL_NANOS));
             } else {
                 this.lastViewedRefinementTime.remove(node.packedPosition());
             }
