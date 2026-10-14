@@ -514,6 +514,19 @@ public class ModelFactory {
 
         var depths = computeModelDepth(textureData, checkMode, layer!=ChunkSectionLayer.SOLID?TextureUtils.DEPTH_MODE_MIN:TextureUtils.DEPTH_MODE_AVG);
 
+        // Report once per newly baked snow model, not in the per-frame rendering path.
+        // Confirm that authored snow overhangs survive software baking in resource packs.
+        if (blockState.is(net.minecraft.world.level.block.Blocks.SNOW)
+                && me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
+            for (int face = 0; face < 6; face++) {
+                org.slf4j.LoggerFactory.getLogger(ModelFactory.class).info(
+                        "Voxy snow diagnostic: state={}, model={}, layer={}, face={}, depth={}, bounds={}, writtenPixels={}",
+                        blockState, modelId, layer, face, depths[face],
+                        java.util.Arrays.toString(TextureUtils.computeBounds(textureData[face], checkMode)),
+                        TextureUtils.getWrittenPixelCount(textureData[face], checkMode));
+            }
+        }
+
         //TODO: THIS, note this can be tested for in 2 ways, re render the model with quad culling disabled and see if the result
         // is the same, (if yes then needs double sided quads)
         // another way to test it is if e.g. up and down havent got anything rendered but the sides do (e.g. all plants etc)

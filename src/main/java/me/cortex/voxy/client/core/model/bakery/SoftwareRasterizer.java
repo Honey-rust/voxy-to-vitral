@@ -44,6 +44,7 @@ public class SoftwareRasterizer {
     private boolean cullBackFace;
     private boolean doTheBlending;
     private boolean rasterUV;
+    private float depthClampMargin;
 
     private int samplerWidth;
     private int samplerHeight;
@@ -69,6 +70,14 @@ public class SoftwareRasterizer {
 
     public void setUVRaster(boolean rasterUV) {
         this.rasterUV = rasterUV;
+    }
+
+    /** Allows a small authored overhang to project onto the voxel boundary. */
+    public void setDepthClampMargin(float margin) {
+        if (!Float.isFinite(margin) || margin < 0 || margin > 1.0f / 64.0f) {
+            throw new IllegalArgumentException("Invalid model depth clamp margin: " + margin);
+        }
+        this.depthClampMargin = margin;
     }
 
     public void setSamplerTexture(int[] texture, int width, int height) {
@@ -185,6 +194,9 @@ public class SoftwareRasterizer {
 
     private void rasterPixel(int index, float b1, float b2, float b3, float z) {//Barry coords
         z = Math.fma(z,0.5f,0.5f);
+        if (this.depthClampMargin > 0 && z >= -this.depthClampMargin && z <= 1 + this.depthClampMargin) {
+            z = Math.clamp(z, 0.0f, 1.0f);
+        }
         if (z<0.0f && -0.000001f<=z) z = 0;//Clamp to 0 if its really small negative
         if (z<0.0f||z>1.0f)
             return;//TODO: check this

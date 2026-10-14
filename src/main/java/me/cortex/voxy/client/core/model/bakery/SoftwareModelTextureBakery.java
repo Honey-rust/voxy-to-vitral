@@ -48,6 +48,7 @@ import static org.lwjgl.opengl.GL30C.GL_FRAMEBUFFER;
 import static org.lwjgl.opengl.GL30C.glBindFramebuffer;
 
 public class SoftwareModelTextureBakery {
+    private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(SoftwareModelTextureBakery.class);
     //Note: the first bit of metadata is if alpha discard is enabled
     private static final Matrix4f[] VIEWS = new Matrix4f[6];
 
@@ -71,7 +72,11 @@ public class SoftwareModelTextureBakery {
         int width = tex.getWidth(targetMipLevel);
         int height = tex.getHeight(targetMipLevel);
 
-        var texture = new int[width * height];
+        var layout = AtlasReadbackLayout.of(width, height);
+        LOGGER.info("Voxy block atlas: {}x{}, format={}, mip={}, pixels={}, bytes={}, readbackBufferBytes={}, mapOffset=0, maxMapLength={}",
+                width, height, tex.getFormat(), targetMipLevel, layout.pixels(), layout.bytes(),
+                layout.bufferBytes(), layout.bufferBytes());
+        var texture = new int[layout.pixels()];
 
         // 在非 Vulkan / 原生 OpenGL 环境下正常走 OpenGL 回读
         if (tex instanceof GlTexture glTex && !me.cortex.voxy.client.core.RenderBackend.isVitrailVulkanActive()) {
@@ -87,27 +92,42 @@ public class SoftwareModelTextureBakery {
             glGetTextureImage(glTex.glId(), 0, GL_RGBA, GL_UNSIGNED_BYTE, texture);
         } else {
 
-            // Read the same RGBA atlas used by the renderer, without OpenGL calls.
-            // setupTexture runs during model-service initialization, before baking starts.
+            // Read mip 0 without resampling. Reuse one bounded staging buffer instead of
+            // allocating and mapping the entire atlas (which may be larger than 2 GiB).
+            // setupTexture runs before baking; publish the sampler only after all rows arrive.
             var device = RenderSystem.getDevice();
             try (var readback = device.createBuffer(() -> "Voxy block atlas readback",
                     GpuBuffer.USAGE_COPY_DST | GpuBuffer.USAGE_MAP_READ,
-                    Math.multiplyExact((long) texture.length, Integer.BYTES))) {
-                var encoder = device.createCommandEncoder();
-                encoder.copyTextureToBuffer(tex, readback, 0L, () -> {}, targetMipLevel);
-                try (var fence = encoder.createFence()) {
-                    encoder.submit();
-                    if (!fence.awaitCompletion(10_000_000_000L)) {
-                        throw new IllegalStateException("Timed out reading Voxy's block atlas from the GPU");
+                    layout.bufferBytes())) {
+                for (int y = 0; y < height;) {
+                    int rows = layout.rowsAt(y);
+                    int pixelOffset = Math.multiplyExact(y, width);
+                    int pixelCount = Math.multiplyExact(rows, width);
+                    long mapLength = Math.multiplyExact((long) pixelCount, Integer.BYTES);
+                    LOGGER.info("Voxy atlas readback: source=(0,{}) {}x{}, format={}, bufferBytes={}, mapOffset=0, mapLength={}, destinationPixelOffset={}",
+                            y, width, rows, tex.getFormat(), readback.size(), mapLength, pixelOffset);
+                    var encoder = device.createCommandEncoder();
+                    encoder.copyTextureToBuffer(tex, readback, 0L, () -> {}, targetMipLevel, 0, y, width, rows);
+                    try (var fence = encoder.createFence()) {
+                        encoder.submit();
+                        if (!fence.awaitCompletion(10_000_000_000L)) {
+                            throw new IllegalStateException("Timed out reading Voxy's block atlas at row " + y);
+                        }
+                        // Wait for GPU completion before reading or reusing the buffer.
+                        // Close the mapped view before the next GPU copy and before buffer.close().
+                        try (var mapped = readback.map(0L, mapLength, true, false)) {
+                            var data = mapped.data();
+                            if (data.remaining() != mapLength) {
+                                throw new IllegalStateException("Unexpected atlas mapping length: " + data.remaining() + " != " + mapLength);
+                            }
+                            // Rasterizer consumes ABGR ints: RGBA bytes in little-endian order.
+                            data.order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(texture, pixelOffset, pixelCount);
+                        }
                     }
-                    try (var mapped = readback.map(true, false)) {
-                        // Rasterizer consumes ABGR ints: RGBA bytes on little-endian storage.
-                        mapped.data().order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(texture);
-                    }
+                    y += rows;
                 }
             }
-            org.slf4j.LoggerFactory.getLogger(SoftwareModelTextureBakery.class)
-                    .info("Voxy Vulkan block atlas readback complete: {}x{}", width, height);
+            LOGGER.info("Voxy Vulkan block atlas readback complete: {}x{}, bytes={}", width, height, layout.bytes());
         }
         
         this.rasterizer.setSamplerTexture(texture, width, height);
@@ -239,6 +259,12 @@ public class SoftwareModelTextureBakery {
 
     public int renderToOutput(BlockState state, long outputBuffer, boolean rasterAsUV) {
         MemoryUtil.memSet(outputBuffer,0,16*16*8*6);
+
+        // Some 3D packs place snow sides at -0.1/16 and 16.1/16 to avoid
+        // coplanar faces. Strict voxel clipping discarded all four sides.
+        // Preserve their texture and projected height, clamping only the small
+        // perpendicular overhang. Reset every bake so other models are unaffected.
+        this.rasterizer.setDepthClampMargin(state.is(Blocks.SNOW) ? 1.0f / 64.0f : 0.0f);
 
 
         boolean isBlock = true;
